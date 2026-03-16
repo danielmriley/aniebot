@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Runtime data (conversations, memory log, workspace)
+data/
+workspace/
+
+# Rust build artifacts
+target/
+
+# Editor
+.vscode/
+.idea/
