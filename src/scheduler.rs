@@ -111,6 +111,7 @@ async fn scheduler_worker(
     let mut id_map: HashMap<String, Uuid> = HashMap::new();
 
     add_morning_summary_job(&sched, bot.clone(), config.clone()).await;
+    add_water_reminder_job(&sched, bot.clone(), config.clone()).await;
     add_health_check_job(&sched, bot.clone(), config.clone()).await;
     load_and_add_persisted_jobs(&sched, &mut id_map, bot.clone(), config.clone())
         .await;
@@ -155,6 +156,37 @@ async fn scheduler_worker(
 // ---------------------------------------------------------------------------
 // Built-in jobs
 // ---------------------------------------------------------------------------
+
+async fn add_water_reminder_job(
+    sched: &JobScheduler,
+    bot: Bot,
+    config: Arc<Config>,
+) {
+    // Fire at 7:30 AM every day, America/New_York (handles EST/EDT automatically).
+    let job = Job::new_async_tz("0 30 7 * * *", chrono_tz::America::New_York, move |_uuid, _lock| {
+        let bot = bot.clone();
+        let cfg = config.clone();
+        Box::pin(async move {
+            tracing::info!("Sending water reminder");
+            let chat_id = cfg.allowed_user_id as i64;
+            if let Err(e) = bot
+                .send_message(ChatId(chat_id), "💧 Good morning! Time to drink some water.")
+                .await
+            {
+                tracing::error!("Failed to send water reminder: {}", e);
+            }
+        })
+    });
+
+    match job {
+        Ok(j) => {
+            if let Err(e) = sched.add(j).await {
+                tracing::error!("Failed to add water reminder job: {}", e);
+            }
+        }
+        Err(e) => tracing::error!("Failed to create water reminder job (bad cron?): {}", e),
+    }
+}
 
 async fn add_morning_summary_job(
     sched: &JobScheduler,
