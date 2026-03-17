@@ -11,8 +11,11 @@ pub async fn run(config: &Config, task: &str) -> Result<String> {
         .arg(task)
         .arg("--allow-all")
         .arg("--silent")
-        .arg("--no-ask-user")
-        .current_dir(&config.workspace_dir);
+        .arg("--no-ask-user");
+    if let Some(model) = &config.copilot_model {
+        cmd.arg("--model").arg(model);
+    }
+    cmd.current_dir(&config.workspace_dir);
 
     let timeout = Duration::from_secs(config.cli_timeout_secs);
 

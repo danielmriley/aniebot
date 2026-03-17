@@ -5,12 +5,13 @@ use teloxide::{dptree, prelude::*, types::ChatAction};
 
 use crate::config::Config;
 use crate::orchestrator;
+use crate::scheduler::SchedulerHandle;
 
-pub async fn run(bot: Bot, config: Arc<Config>) {
+pub async fn run(bot: Bot, config: Arc<Config>, scheduler: Arc<SchedulerHandle>) {
     let handler = Update::filter_message().endpoint(handle_message);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config])
+        .dependencies(dptree::deps![config, scheduler])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
@@ -21,6 +22,7 @@ async fn handle_message(
     bot: Bot,
     msg: Message,
     config: Arc<Config>,
+    scheduler: Arc<SchedulerHandle>,
 ) -> ResponseResult<()> {
     // Auth gate: silently drop messages from anyone other than the owner.
     if msg.from.as_ref().map(|u| u.id.0) != Some(config.allowed_user_id) {
@@ -45,7 +47,7 @@ async fn handle_message(
     });
 
     let chat_id = msg.chat.id.0;
-    let reply = orchestrator::process_message(config, chat_id, &text).await;
+    let reply = orchestrator::process_message(config, bot.clone(), scheduler, chat_id, &text).await;
 
     typing_task.abort();
     bot.send_message(msg.chat.id, reply).await?;

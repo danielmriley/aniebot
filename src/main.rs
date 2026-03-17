@@ -9,6 +9,7 @@ mod cli_wrapper;
 mod config;
 mod memory;
 mod orchestrator;
+mod schedule_store;
 mod scheduler;
 
 use config::Config;
@@ -24,13 +25,14 @@ async fn main() -> Result<()> {
     let config = Arc::new(Config::from_env()?);
 
     tokio::fs::create_dir_all("data/conversations").await?;
+    tokio::fs::create_dir_all("data").await?;
     tokio::fs::create_dir_all(&config.workspace_dir).await?;
 
     tracing::info!("AnieBot starting...");
 
     let bot = Bot::new(config.telegram_token.clone());
-    tokio::spawn(scheduler::start(bot.clone(), config.clone()));
-    bot::run(bot, config).await;
+    let scheduler = scheduler::start(bot.clone(), config.clone()).await;
+    bot::run(bot, config, scheduler).await;
 
     Ok(())
 }
