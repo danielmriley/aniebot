@@ -11,6 +11,7 @@ mod memory;
 mod orchestrator;
 mod schedule_store;
 mod scheduler;
+mod tools;
 
 use config::Config;
 

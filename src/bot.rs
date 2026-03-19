@@ -50,7 +50,36 @@ async fn handle_message(
     let reply = orchestrator::process_message(config, bot.clone(), scheduler, chat_id, &text).await;
 
     typing_task.abort();
-    bot.send_message(msg.chat.id, reply).await?;
+
+    // Telegram hard-limits messages to 4096 chars. Chunk at word boundaries.
+    for chunk in split_message(&reply, 4000) {
+        bot.send_message(msg.chat.id, chunk).await?;
+    }
 
     Ok(())
+}
+
+/// Split `text` into chunks of at most `max_len` characters, breaking at
+/// whitespace where possible so words are never cut in half.
+fn split_message(text: &str, max_len: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let end = (start + max_len).min(text.len());
+        // Try to break at the last whitespace within the window.
+        let split = if end == text.len() {
+            end
+        } else {
+            text[start..end].rfind(|c: char| c.is_whitespace())
+                .map(|p| start + p)
+                .unwrap_or(end) // no whitespace found — hard-cut
+        };
+        chunks.push(text[start..split].trim());
+        start = split;
+        // Skip leading whitespace for the next chunk.
+        while start < text.len() && text.as_bytes()[start].is_ascii_whitespace() {
+            start += 1;
+        }
+    }
+    chunks.into_iter().filter(|s| !s.is_empty()).collect()
 }

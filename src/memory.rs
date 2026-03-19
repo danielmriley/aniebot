@@ -10,8 +10,15 @@ const MEMORY_FILE: &str = "data/memory.json";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ConversationMessage {
-    pub role: String, // "user" or "assistant"
-    pub content: String,
+    pub role: String,
+    // null for assistant turns that issued a tool call
+    pub content: Option<String>,
+    // set on role=="assistant" tool-call turns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
+    // set on role=="tool" turns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
