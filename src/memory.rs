@@ -54,9 +54,11 @@ pub async fn append_messages(
     messages: &[ConversationMessage],
 ) -> anyhow::Result<()> {
     let path = format!("{}/{}.json", CONVERSATIONS_DIR, chat_id);
+    let tmp_path = format!("{}/{}.json.tmp", CONVERSATIONS_DIR, chat_id);
     let mut history = load_history(chat_id).await?;
     history.extend_from_slice(messages);
-    tokio::fs::write(&path, serde_json::to_vec_pretty(&history)?).await?;
+    tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&history)?).await?;
+    tokio::fs::rename(&tmp_path, &path).await?;
     Ok(())
 }
 
@@ -78,7 +80,9 @@ pub async fn store_interaction(
 
     let mut log = load_memory_log().await?;
     log.push(entry);
-    tokio::fs::write(MEMORY_FILE, serde_json::to_vec_pretty(&log)?).await?;
+    let tmp = format!("{}.tmp", MEMORY_FILE);
+    tokio::fs::write(&tmp, serde_json::to_vec_pretty(&log)?).await?;
+    tokio::fs::rename(&tmp, MEMORY_FILE).await?;
     Ok(())
 }
 

@@ -38,295 +38,177 @@ pub struct LmFunctionCall {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (JSON Schema sent to LM Studio)
+// Tool helpers — one function per tool; composed into the three public sets below
 // ---------------------------------------------------------------------------
 
-pub fn tool_definitions() -> serde_json::Value {
-    json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "delegate_cli",
-                "description": "Execute a task using copilot, which has full filesystem access, internet access, and can run shell commands. Use this for: fetching news, weather, stock prices, or any real-time data; reading or writing files; running shell commands; web searches; anything requiring information beyond your training data. Do NOT use this for reactions, thank-yous, follow-up comments, or opinion questions about information you already provided — use reply_to_user for those.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "Precise, self-contained task description for copilot. Include all context needed."
-                        }
-                    },
-                    "required": ["task"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "schedule_task",
-                "description": "Create a recurring scheduled reminder or automated task.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "cron": {
-                            "type": "string",
-                            "description": "Cron expression in 5-field (MIN HRS DOM MON DOW) or 6-field Quartz format (SEC MIN HRS DOM MON DOW). Examples: daily at 08:00 = '0 8 * * *', weekdays at 09:30 = '30 9 * * Mon-Fri', every 15 minutes = '*/15 * * * *'. A leading seconds field of 0 is added automatically if omitted."
-                        },
-                        "label": {
-                            "type": "string",
-                            "description": "Human-readable name for this scheduled job."
-                        },
-                        "task": {
-                            "type": "string",
-                            "description": "The prompt that will be run as a task when this job fires."
-                        }
-                    },
-                    "required": ["cron", "label", "task"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_schedules",
-                "description": "List all currently scheduled jobs.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "delete_schedule",
-                "description": "Delete a scheduled job by its UUID.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "schedule_id": {
-                            "type": "string",
-                            "description": "The UUID of the schedule to delete."
-                        }
-                    },
-                    "required": ["schedule_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reply_to_user",
-                "description": "Send a direct conversational reply to the user. Use this for: greetings; thank-yous and acknowledgements ('thanks', 'got it', 'that's a lot'); reactions to information you just provided; opinion and discussion questions ('what do you think', 'how do you feel'); casual conversation; anything that does not require fetching new external data. When in doubt, use this tool.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "The reply text to send to the user."
-                        }
-                    },
-                    "required": ["message"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "update_core_memory",
-                "description": "Update a section of your persistent core memory. Use this when you learn something genuinely new or significant about yourself, your beliefs, or the user. Be conservative — only update when something meaningfully new has been established.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "section": {
-                            "type": "string",
-                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
-                            "description": "Which section to update. Use identity for your own self-description; beliefs for your evolving worldview; user_profile for facts about the user; curiosity_queue for topics you want to explore."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "New value for the section. Plain text for identity/user_profile. JSON array of strings for beliefs/curiosity_queue, e.g. [\"item1\",\"item2\"]."
-                        }
-                    },
-                    "required": ["section", "content"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "remember",
-                "description": "Log a specific observation, fact, or event to episodic memory for future recall. Use for things too detailed or transient for core memory — e.g. a specific conversation moment, a user preference detail, or a one-off event.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "The observation or fact to remember."
-                        },
-                        "tags": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Optional topic tags for later retrieval, e.g. [\"music\", \"preferences\"]."
-                        },
-                        "importance": {
-                            "type": "integer",
-                            "description": "Importance 1–5 (5 = most important). Use 3 if unsure."
-                        }
-                    },
-                    "required": ["content", "tags", "importance"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "recall",
-                "description": "Search episodic and archival memory by keyword or tags. Use this before answering questions about past events or user preferences that may not be in the recent conversation.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Keyword or phrase to search for in stored memories."
-                        },
-                        "tags": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Optional tags to filter results."
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "add_interest",
-                "description": "Register a topic you want to proactively track and receive updates about. The bot will check in on this interest automatically according to the cron schedule (or during every heartbeat if no cron is given).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {
-                            "type": "string",
-                            "description": "Short name for the interest, e.g. 'SpaceX launches'."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "What specifically to look for or track."
-                        },
-                        "check_cron": {
-                            "type": "string",
-                            "description": "Optional 6-field Quartz cron for dedicated checks (e.g. '0 0 9 * * Mon' = Monday 09:00 UTC). Omit to rely on the hourly heartbeat."
-                        }
-                    },
-                    "required": ["topic", "description"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "retire_interest",
-                "description": "Remove a previously registered interest by its ID. Use when the topic is no longer relevant.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "interest_id": {
-                            "type": "string",
-                            "description": "The UUID of the interest to retire, as shown in core memory."
-                        }
-                    },
-                    "required": ["interest_id"]
-                }
+fn tool_delegate_cli() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "delegate_cli",
+            "description": "Execute a task using copilot, which has full filesystem access, internet access, and can run shell commands. Use this for: fetching news, weather, stock prices, or any real-time data; reading or writing files; running shell commands; web searches; anything requiring information beyond your training data. Do NOT use this for reactions, thank-yous, follow-up comments, or opinion questions about information you already provided — use reply_to_user for those.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Precise, self-contained task description for copilot. Include all context needed."
+                    }
+                },
+                "required": ["task"]
             }
         }
-    ])
+    })
 }
 
-/// Tool definitions for the heartbeat / interest-check agentic loops.
-/// Excludes user-specific tools (schedule_task, list_schedules, delete_schedule,
-/// update_core_memory, remember, recall) to keep the heartbeat focused.
-pub fn heartbeat_tool_definitions() -> serde_json::Value {
-    json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "delegate_cli",
-                "description": "Execute a task using copilot, which has full filesystem access, internet access, and can run shell commands. Use this for fetching news, weather, stock prices, or any real-time data relevant to your active interests.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "task": {
-                            "type": "string",
-                            "description": "Precise, self-contained task description for copilot."
-                        }
+fn tool_schedule_task() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "schedule_task",
+            "description": "Create a recurring scheduled reminder or automated task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron": {
+                        "type": "string",
+                        "description": "Cron expression in 5-field (MIN HRS DOM MON DOW) or 6-field Quartz format (SEC MIN HRS DOM MON DOW). Examples: daily at 08:00 = '0 8 * * *', weekdays at 09:30 = '30 9 * * Mon-Fri', every 15 minutes = '*/15 * * * *'. A leading seconds field of 0 is added automatically if omitted."
                     },
-                    "required": ["task"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reply_to_user",
-                "description": "Send a proactive message to the user. Only use this if you have something genuinely worth sharing — silence is the default.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "message": { "type": "string", "description": "The message to send." }
+                    "label": {
+                        "type": "string",
+                        "description": "Human-readable name for this scheduled job."
                     },
-                    "required": ["message"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "add_interest",
-                "description": "Register a new topic to track proactively.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": { "type": "string", "description": "Short name for the interest." },
-                        "description": { "type": "string", "description": "What to look for." },
-                        "check_cron": { "type": "string", "description": "Optional 6-field Quartz cron for dedicated checks." }
-                    },
-                    "required": ["topic", "description"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "retire_interest",
-                "description": "Remove a previously registered interest by its ID.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "interest_id": { "type": "string", "description": "UUID of the interest to retire." }
-                    },
-                    "required": ["interest_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "nothing",
-                "description": "Do nothing and stay silent. Use this as the default when there is nothing worth sharing with the user right now.",
-                "parameters": { "type": "object", "properties": {} }
+                    "task": {
+                        "type": "string",
+                        "description": "The prompt that will be run as a task when this job fires."
+                    }
+                },
+                "required": ["cron", "label", "task"]
             }
         }
-    ])
+    })
 }
 
-/// Tool definitions for the consolidation reflection pass.
-/// Allows the model to update core memory, persist observations, manage interests.
-pub fn consolidation_tool_definitions() -> serde_json::Value {
-    json!([
-        {
+fn tool_list_schedules() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_schedules",
+            "description": "List all currently scheduled jobs.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_delete_schedule() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "delete_schedule",
+            "description": "Delete a scheduled job by its UUID.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "The UUID of the schedule to delete."
+                    }
+                },
+                "required": ["schedule_id"]
+            }
+        }
+    })
+}
+
+fn tool_update_schedule() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "update_schedule",
+            "description": "Modify an existing scheduled job. Only the fields you provide are changed — omit any field to leave it as-is. The job ID is preserved.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": {
+                        "type": "string",
+                        "description": "The UUID of the schedule to update."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "New human-readable name for the job (optional)."
+                    },
+                    "cron": {
+                        "type": "string",
+                        "description": "New cron expression in 5- or 6-field format (optional). Same rules as schedule_task."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "New prompt that runs when the job fires (optional)."
+                    }
+                },
+                "required": ["schedule_id"]
+            }
+        }
+    })
+}
+
+fn tool_schedule_once() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "schedule_once",
+            "description": "Run a task once at a future time, then auto-delete. For relative times ('in 5 minutes', 'in 2 hours') use delay_seconds. For specific clock times only, use fire_at with an ISO 8601 UTC string.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": "Seconds from now until the job fires. Preferred for relative times: 5 minutes = 300, 1 hour = 3600. Mutually exclusive with fire_at."
+                    },
+                    "fire_at": {
+                        "type": "string",
+                        "description": "ISO 8601 UTC datetime when the job should fire. Only use this when the user specifies a specific clock time. Mutually exclusive with delay_seconds."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Human-readable name for this one-time job."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The prompt that will be executed when the job fires."
+                    }
+                },
+                "required": ["label", "task"]
+            }
+        }
+    })
+}
+
+fn tool_reply_to_user() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "reply_to_user",
+            "description": "Send a direct conversational reply to the user. Use this for: greetings; thank-yous and acknowledgements ('thanks', 'got it', 'that's a lot'); reactions to information you just provided; opinion and discussion questions ('what do you think', 'how do you feel'); casual conversation; anything that does not require fetching new external data. When in doubt, use this tool.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The reply text to send to the user."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    })
+}
+
+/// `include_identity`: true in the consolidation pass (exposes the "identity" enum value and
+/// its surgical-edit guidance); false everywhere else.
+fn tool_update_core_memory(include_identity: bool) -> serde_json::Value {
+    if include_identity {
+        json!({
             "type": "function",
             "function": {
                 "name": "update_core_memory",
@@ -336,8 +218,8 @@ pub fn consolidation_tool_definitions() -> serde_json::Value {
                     "properties": {
                         "section": {
                             "type": "string",
-                            "enum": ["beliefs", "user_profile", "curiosity_queue"],
-                            "description": "Which section to overwrite. Note: 'identity' is read-only and cannot be changed during consolidation."
+                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to update. identity for your self-description — only update if the High-Significance Episodes block contains evidence that warrants a surgical edit (add, revise, or remove a specific clause; do not rewrite wholesale). beliefs for your evolving worldview; user_profile for facts about the user; curiosity_queue for topics to investigate."
                         },
                         "content": {
                             "type": "string",
@@ -347,61 +229,287 @@ pub fn consolidation_tool_definitions() -> serde_json::Value {
                     "required": ["section", "content"]
                 }
             }
-        },
-        {
+        })
+    } else {
+        json!({
             "type": "function",
             "function": {
-                "name": "remember",
-                "description": "Persist an important observation to episodic memory.",
+                "name": "update_core_memory",
+                "description": "Update a section of your persistent core memory. Use this when you learn something genuinely new or significant about your beliefs, the user, or topics to investigate. Be conservative — only update when something meaningfully new has been established.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "content": { "type": "string", "description": "The observation to record." },
-                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Categorization tags." },
-                        "importance": { "type": "integer", "description": "Importance 1-5. Use 5 for consolidation-promoted facts." }
+                        "section": {
+                            "type": "string",
+                            "enum": ["beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to update. Use beliefs for your evolving worldview; user_profile for facts about the user; curiosity_queue for topics you want to investigate."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New value for the section. Plain text for user_profile. JSON array of strings for beliefs/curiosity_queue, e.g. [\"item1\",\"item2\"]."
+                        }
                     },
-                    "required": ["content", "importance"]
+                    "required": ["section", "content"]
                 }
             }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "add_interest",
-                "description": "Register a new topic to track proactively.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": { "type": "string", "description": "Short name for the interest." },
-                        "description": { "type": "string", "description": "What to look for." },
-                        "check_cron": { "type": "string", "description": "Optional cron for dedicated checks." }
+        })
+    }
+}
+
+fn tool_remember() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Log a specific observation, fact, or event to episodic memory for future recall. Use for things too detailed or transient for core memory — e.g. a specific conversation moment, a user preference detail, or a one-off event. Use importance 5 for consolidation-promoted facts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The observation or fact to remember."
                     },
-                    "required": ["topic", "description"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "retire_interest",
-                "description": "Remove a previously registered interest by its ID.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "interest_id": { "type": "string", "description": "UUID of the interest to retire." }
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Topic tags for later retrieval, e.g. [\"music\", \"preferences\"]."
                     },
-                    "required": ["interest_id"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "nothing",
-                "description": "Nothing to update from this consolidation cycle.",
-                "parameters": { "type": "object", "properties": {} }
+                    "importance": {
+                        "type": "integer",
+                        "description": "Importance 1–5 (5 = most important). Use 3 if unsure."
+                    }
+                },
+                "required": ["content", "tags", "importance"]
             }
         }
+    })
+}
+
+fn tool_recall() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": "Search episodic and archival memory by keyword or tags. Use this before answering questions about past events or user preferences that may not be in the recent conversation. In the heartbeat context, use this before sending a proactive message to check if the topic was already covered recently.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keyword or phrase to search for in stored memories."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tags to filter results."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn tool_add_interest() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "add_interest",
+            "description": "Register a topic you want to proactively track and receive updates about. The bot will check in on this interest automatically according to the cron schedule (or during every heartbeat if no cron is given).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Short name for the interest, e.g. 'SpaceX launches'."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What specifically to look for or track."
+                    },
+                    "check_cron": {
+                        "type": "string",
+                        "description": "Optional 6-field Quartz cron for dedicated checks (e.g. '0 0 9 * * Mon' = Monday 09:00 UTC). Omit to rely on the hourly heartbeat."
+                    }
+                },
+                "required": ["topic", "description"]
+            }
+        }
+    })
+}
+
+fn tool_retire_interest() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "retire_interest",
+            "description": "Remove a previously registered interest by its ID. Use when the topic is no longer relevant.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "interest_id": {
+                        "type": "string",
+                        "description": "The UUID of the interest to retire, as shown in core memory."
+                    }
+                },
+                "required": ["interest_id"]
+            }
+        }
+    })
+}
+
+fn tool_list_interests() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_interests",
+            "description": "List all currently registered interests, including their topic, description, health score, check schedule, and ID.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_forget() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": "Permanently delete an episodic memory entry by its UUID. Use when a stored note is incorrect, stale, or should no longer be recalled.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entry_id": {
+                        "type": "string",
+                        "description": "UUID of the episodic entry to delete, as returned by recall."
+                    }
+                },
+                "required": ["entry_id"]
+            }
+        }
+    })
+}
+
+fn tool_nothing(description: &str) -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "nothing",
+            "description": description,
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_set_task() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "set_task",
+            "description": "Record the current task or active project I'm helping with. Appears in every system prompt after 'Who I Am'. Call this when the user starts a new project or multi-step task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the current task (1-2 sentences)."
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    })
+}
+
+fn tool_clear_task() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "clear_task",
+            "description": "Clear the current task once it is complete or no longer relevant.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_reflect() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "reflect",
+            "description": "Pause and assess your current progress. Call this after any series of searches or tool calls to decide what to do next. Write what you found (or did not find) in observation, then set done=true if the task is complete or there is nothing more useful to do. This is the primary way to conclude an agentic loop.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "observation": {
+                        "type": "string",
+                        "description": "What have you done so far and what did you find or not find?"
+                    },
+                    "done": {
+                        "type": "boolean",
+                        "description": "true if the task is complete or there is nothing more useful to do."
+                    }
+                },
+                "required": ["observation", "done"]
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions (JSON Schema sent to LM Studio)
+// ---------------------------------------------------------------------------
+
+pub fn tool_definitions() -> serde_json::Value {
+    json!([
+        tool_delegate_cli(),
+        tool_schedule_task(),
+        tool_list_schedules(),
+        tool_delete_schedule(),
+        tool_update_schedule(),
+        tool_schedule_once(),
+        tool_reply_to_user(),
+        tool_update_core_memory(false),
+        tool_remember(),
+        tool_recall(),
+        tool_add_interest(),
+        tool_retire_interest(),
+        tool_list_interests(),
+        tool_forget(),
+        tool_set_task(),
+        tool_clear_task(),
+        tool_reflect(),
+    ])
+}
+
+/// Tool definitions for the heartbeat / interest-check agentic loops.
+pub fn heartbeat_tool_definitions() -> serde_json::Value {
+    json!([
+        tool_delegate_cli(),
+        tool_reply_to_user(),
+        tool_add_interest(),
+        tool_retire_interest(),
+        tool_update_core_memory(false),
+        tool_recall(),
+        tool_forget(),
+        tool_set_task(),
+        tool_clear_task(),
+        tool_reflect(),
+        tool_nothing("Do nothing and stay silent. Use this as the default when there is nothing worth sharing with the user right now."),
+    ])
+}
+
+/// Tool definitions for the consolidation reflection pass.
+/// Allows the model to update core memory, persist observations, manage interests.
+pub fn consolidation_tool_definitions() -> serde_json::Value {
+    json!([
+        tool_update_core_memory(true),
+        tool_remember(),
+        tool_add_interest(),
+        tool_retire_interest(),
+        tool_set_task(),
+        tool_clear_task(),
+        tool_reflect(),
+        tool_nothing("Nothing to update from this consolidation cycle."),
     ])
 }
 
@@ -430,7 +538,7 @@ pub async fn dispatch_tool_call(
             tracing::info!("Delegating to copilot: {}", task);
             match cli_wrapper::run(&config, task).await {
                 Ok(output) => Ok(format!("✅ Done!\n\n{}", output)),
-                Err(e) => Ok(format!("❌ CLI error: {}", e)),
+                Err(e) => Ok(format!("❌ copilot failed: {}", e)),
             }
         }
         "schedule_task" => {
@@ -470,6 +578,7 @@ pub async fn dispatch_tool_call(
                 cron: cron.clone(),
                 task: task.to_string(),
                 created_at: Utc::now(),
+                fire_once_at: None,
             };
             let entry_id = entry.id.clone();
             let entry_label = entry.label.clone();
@@ -490,7 +599,7 @@ pub async fn dispatch_tool_call(
             }
             let list = entries
                 .iter()
-                .map(|e| format!("• *{}*\n  ID: `{}`\n  Cron: `{}`", e.label, e.id, e.cron))
+                .map(|e| format!("• *{}*\n  ID: `{}`\n  Cron: `{}` (UTC)\n  Task: {}", e.label, e.id, e.cron, e.task))
                 .collect::<Vec<_>>()
                 .join("\n\n");
             Ok(format!("Scheduled jobs:\n\n{}", list))
@@ -506,7 +615,81 @@ pub async fn dispatch_tool_call(
                 Ok(format!("❌ No schedule found with ID `{}`.", id))
             }
         }
-        "update_core_memory" => {
+        "update_schedule" => {
+            let id = args["schedule_id"].as_str()
+                .context("update_schedule missing 'schedule_id'")?;
+
+            let entries = schedule_store::load().await.unwrap_or_default();
+            let Some(mut entry) = entries.into_iter().find(|e| e.id == id) else {
+                return Ok(format!("❌ No schedule found with ID `{}`.", id));
+            };
+
+            if let Some(new_label) = args["label"].as_str() {
+                entry.label = new_label.to_string();
+            }
+            if let Some(new_task) = args["task"].as_str() {
+                entry.task = new_task.to_string();
+            }
+            if let Some(new_cron_local) = args["cron"].as_str() {
+                let promoted = match new_cron_local.split_whitespace().count() {
+                    5 => format!("0 {}", new_cron_local),
+                    _ => new_cron_local.to_string(),
+                };
+                entry.cron = cron_local_to_utc(&promoted);
+            }
+
+            let _ = scheduler::remove_dynamic_job(&scheduler, id).await;
+            let _ = schedule_store::remove(id).await;
+            if let Err(e) = scheduler::add_dynamic_job(&scheduler, bot, config.clone(), entry.clone()).await {
+                return Ok(format!("❌ Failed to re-register job: {}", e));
+            }
+            if let Err(e) = schedule_store::append(entry.clone()).await {
+                tracing::warn!("Failed to persist updated schedule: {}", e);
+            }
+
+            Ok(format!("✅ Updated schedule `{}` (*{}*).", entry.id, entry.label))
+        }        "schedule_once" => {
+            let fire_at: chrono::DateTime<Utc> = if let Some(secs) = args["delay_seconds"].as_i64() {
+                if secs <= 0 {
+                    return Ok("\u{274c} `delay_seconds` must be a positive integer.".to_string());
+                }
+                Utc::now() + chrono::Duration::seconds(secs)
+            } else if let Some(fire_at_str) = args["fire_at"].as_str() {
+                let dt = chrono::DateTime::parse_from_rfc3339(fire_at_str)
+                    .context("schedule_once: invalid ISO 8601 datetime for 'fire_at'")?
+                    .with_timezone(&Utc);
+                if dt <= Utc::now() {
+                    let server_now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+                    return Ok(format!(
+                        "\u{274c} `fire_at` must be in the future (server UTC is `{server_now}`). \
+                         For relative times like 'in 5 minutes', use delay_seconds=300 instead."
+                    ));
+                }
+                dt
+            } else {
+                return Ok("\u{274c} schedule_once requires either `delay_seconds` (preferred) or `fire_at`.".to_string());
+            };
+            let label = args["label"].as_str()
+                .context("schedule_once missing 'label'")?;
+            let task = args["task"].as_str()
+                .context("schedule_once missing 'task'")?;
+            let fire_at_display = fire_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let entry = ScheduleEntry {
+                id: Uuid::new_v4().to_string(),
+                label: label.to_string(),
+                cron: String::new(),
+                task: task.to_string(),
+                created_at: Utc::now(),
+                fire_once_at: Some(fire_at),
+            };
+            if let Err(e) = scheduler::add_dynamic_job(&scheduler, bot, config.clone(), entry.clone()).await {
+                return Ok(format!("\u{274c} Failed to schedule one-time job: {}", e));
+            }
+            if let Err(e) = schedule_store::append(entry.clone()).await {
+                tracing::warn!("Failed to persist one-time schedule: {}", e);
+            }
+            Ok(format!("\u{2705} One-time job *{}* scheduled for `{}`.", entry.label, fire_at_display))
+        }        "update_core_memory" => {
             let section = args["section"].as_str()
                 .context("update_core_memory missing 'section' argument")?;
             let content = args["content"].as_str()
@@ -548,6 +731,15 @@ pub async fn dispatch_tool_call(
                     .map(|e| format!("[{}] (importance: {}) {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.content))
                     .collect();
                 Ok(lines.join("\n"))
+            }
+        }
+        "forget" => {
+            let id = args["entry_id"].as_str()
+                .context("forget missing 'entry_id' argument")?;
+            if episodic::delete(id).await? {
+                Ok("\u{2713} Forgotten.".into())
+            } else {
+                Ok("\u{274c} Entry not found.".into())
             }
         }
         "add_interest" => {
@@ -595,28 +787,89 @@ pub async fn dispatch_tool_call(
             let _ = crate::scheduler::remove_dynamic_job(&scheduler, id).await;
             Ok("\u{2713} Interest retired.".into())
         }
+        "list_interests" => {
+            let core = core_memory::load().await?;
+            if core.interests.is_empty() {
+                return Ok("No active interests registered.".into());
+            }
+            let list = core.interests.iter().map(|i| {
+                let cron = i.check_cron.as_deref().unwrap_or("global heartbeat");
+                format!("• {}\n  ID: `{}`\n  {}\n  Health: {}%  |  Check: {}", i.topic, i.id, i.description, i.health, cron)
+            }).collect::<Vec<_>>().join("\n\n");
+            Ok(format!("Active interests:\n\n{}", list))
+        }
         "nothing" => Ok(String::new()),
+        "reflect" => {
+            let observation = args["observation"].as_str().unwrap_or("(no observation)");
+            let done = args["done"].as_bool().unwrap_or(false);
+            Ok(format!("Reflection recorded: {observation} (concluded: {done})"))
+        }
+        "set_task" => {
+            let desc = args["description"].as_str()
+                .context("set_task missing 'description'")?;
+            core_memory::set_task(desc).await?;
+            Ok(format!("\u{2705} Current task set: {desc}"))
+        }
+        "clear_task" => {
+            core_memory::clear_task().await?;
+            Ok("\u{2705} Current task cleared.".to_string())
+        }
         other => anyhow::bail!("Unknown tool name: {}", other),
     }
 }
 
+/// Advance a simple DOW field by `delta` days (typically ±1 from a midnight rollover).
+/// Returns `None` if the field is a complex expression (`*`, ranges, steps, lists) —
+/// the caller should leave it unchanged in that case.
+///
+/// Handles:
+///   - Numeric 0–7 (0 and 7 both mean Sunday); result is always in 0–6.
+///   - Named: Sun/Mon/Tue/Wed/Thu/Fri/Sat (case-insensitive); result preserves case style.
+fn advance_dow(dow: &str, delta: i32) -> Option<String> {
+    // Skip complex expressions.
+    if dow.contains(['*', '-', '/', ',']) {
+        return None;
+    }
+    const NAMES: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    // Try numeric first.
+    if let Ok(n) = dow.parse::<i32>() {
+        let shifted = (n + delta).rem_euclid(7);
+        return Some(shifted.to_string());
+    }
+    // Try named (case-insensitive).
+    let idx = NAMES.iter().position(|&d| d.eq_ignore_ascii_case(dow))?;
+    let shifted = (idx as i32 + delta).rem_euclid(7) as usize;
+    Some(NAMES[shifted].to_string())
+}
+
 /// Convert a Quartz 6-field cron expression from the system's local timezone to UTC.
-/// Only adjusts plain numeric hour (and minute) fields. Returns the original on any
-/// parse failure so the scheduler's own validation can surface the error.
+/// Adjusts plain numeric hour and minute fields, and corrects the DOW field when the
+/// conversion crosses midnight (day_delta ≠ 0). Returns the original on any parse
+/// failure so the scheduler's own validation can surface the error.
 ///
-/// When the HOURS or MINUTES fields use wildcards, ranges, or step patterns the
-/// expression is returned unchanged (the scheduler fires in UTC, which equals local
-/// time only in the UTC timezone in such cases).
+/// When HOURS or MINUTES use wildcards, ranges, or step patterns the expression is
+/// returned unchanged. When DOW is a complex expression (range, list, step, `*`) the
+/// hour/minute shift is still applied but the DOW field is left as-is.
 ///
-/// Example (EDT, UTC-4): "0 30 7 * * *" → "0 30 11 * * *"
+/// Note: the UTC offset is captured at scheduling time. DST transitions that occur
+/// after a job is created will cause the effective local fire-time to drift by one hour.
+///
+/// Examples (EDT, UTC-4):
+///   "0 30 7 * * *"   → "0 30 11 * * *"   (DOW is *, left unchanged)
+///   "0 30 23 * * Fri" → "0 30 3 * * Sat"  (midnight rollover → DOW advanced)
 fn cron_local_to_utc(cron: &str) -> String {
+    let offset_secs = chrono::Local::now().offset().local_minus_utc();
+    cron_local_to_utc_with_offset(cron, offset_secs / 60)
+}
+
+/// Inner implementation that accepts an explicit `offset_mins` (local − UTC, negative
+/// west of UTC) rather than reading the system clock. Used directly by unit tests.
+fn cron_local_to_utc_with_offset(cron: &str, offset_mins: i32) -> String {
     let parts: Vec<&str> = cron.split_whitespace().collect();
     if parts.len() != 6 {
         return cron.to_string();
     }
 
-    // Parse hour and minute; bail out (with a warning) if either field uses wildcards/ranges
-    // — we can't shift those fields by a fixed offset.
     let Ok(local_h) = parts[2].parse::<i32>() else {
         tracing::debug!(
             "cron_local_to_utc: non-integer HOURS field '{}', skipping timezone conversion",
@@ -632,15 +885,166 @@ fn cron_local_to_utc(cron: &str) -> String {
         return cron.to_string();
     };
 
-    // local_minus_utc() is negative for zones west of UTC (e.g. EDT = -14400).
-    let offset_secs = chrono::Local::now().offset().local_minus_utc();
-    let offset_h = offset_secs / 3600;
-    let offset_m = (offset_secs % 3600) / 60;
+    let offset_h = offset_mins / 60;
+    let offset_m = offset_mins % 60;
 
-    // Subtract the offset to convert local → UTC.
     let total_utc_mins = local_h * 60 + local_m - offset_h * 60 - offset_m;
     let utc_h = total_utc_mins.div_euclid(60).rem_euclid(24);
     let utc_m = total_utc_mins.rem_euclid(60);
 
-    format!("{} {} {} {} {} {}", parts[0], utc_m, utc_h, parts[3], parts[4], parts[5])
+    let day_delta = total_utc_mins.div_euclid(24 * 60);
+    let dow = if day_delta != 0 {
+        advance_dow(parts[5], day_delta).unwrap_or_else(|| parts[5].to_string())
+    } else {
+        parts[5].to_string()
+    };
+
+    format!("{} {} {} {} {} {}", parts[0], utc_m, utc_h, parts[3], parts[4], dow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // advance_dow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn advance_dow_named_no_rollover() {
+        assert_eq!(advance_dow("Mon", 1), Some("Tue".into()));
+        assert_eq!(advance_dow("Fri", 1), Some("Sat".into()));
+    }
+
+    #[test]
+    fn advance_dow_named_rollover_forward() {
+        // Sat + 1 day = Sun (index 0)
+        assert_eq!(advance_dow("Sat", 1), Some("Sun".into()));
+    }
+
+    #[test]
+    fn advance_dow_named_rollover_backward() {
+        // Sun - 1 day = Sat (index 6)
+        assert_eq!(advance_dow("Sun", -1), Some("Sat".into()));
+    }
+
+    #[test]
+    fn advance_dow_numeric() {
+        assert_eq!(advance_dow("5", 1), Some("6".into())); // Fri → Sat
+        assert_eq!(advance_dow("6", 1), Some("0".into())); // Sat → Sun
+    }
+
+    #[test]
+    fn advance_dow_case_insensitive() {
+        assert_eq!(advance_dow("fri", 1), Some("Sat".into()));
+        assert_eq!(advance_dow("FRI", 1), Some("Sat".into()));
+    }
+
+    #[test]
+    fn advance_dow_complex_expressions_skipped() {
+        assert_eq!(advance_dow("*", 1), None);
+        assert_eq!(advance_dow("Mon-Fri", 1), None);
+        assert_eq!(advance_dow("1,3,5", 1), None);
+        assert_eq!(advance_dow("*/2", 1), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // cron_local_to_utc_with_offset — deterministic (offset injected)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cron_utc_offset_zero_is_identity() {
+        assert_eq!(
+            cron_local_to_utc_with_offset("0 30 9 * * *", 0),
+            "0 30 9 * * *"
+        );
+    }
+
+    #[test]
+    fn cron_positive_offset_shifts_back() {
+        // UTC+1: local 09:30 → UTC 08:30
+        assert_eq!(
+            cron_local_to_utc_with_offset("0 30 9 * * *", 60),
+            "0 30 8 * * *"
+        );
+    }
+
+    #[test]
+    fn cron_negative_offset_shifts_forward() {
+        // UTC-4 (EDT): local 07:30 → UTC 11:30
+        assert_eq!(
+            cron_local_to_utc_with_offset("0 30 7 * * *", -240),
+            "0 30 11 * * *"
+        );
+    }
+
+    #[test]
+    fn cron_dow_rollover_edt() {
+        // Phase 2 regression: Friday 23:30 local at UTC-4 → Saturday 03:30 UTC
+        assert_eq!(
+            cron_local_to_utc_with_offset("0 30 23 * * Fri", -240),
+            "0 30 3 * * Sat"
+        );
+    }
+
+    #[test]
+    fn cron_dow_rollover_utc_plus_1_backward() {
+        // Sunday 00:30 local at UTC+1 → Saturday 23:30 UTC
+        assert_eq!(
+            cron_local_to_utc_with_offset("0 30 0 * * Sun", 60),
+            "0 30 23 * * Sat"
+        );
+    }
+
+    #[test]
+    fn cron_wildcard_hour_returned_unchanged() {
+        let input = "0 30 * * * *";
+        assert_eq!(cron_local_to_utc_with_offset(input, -240), input);
+    }
+
+    #[test]
+    fn cron_wrong_field_count_returned_unchanged() {
+        let input = "30 9 * * *"; // 5-field, not 6
+        assert_eq!(cron_local_to_utc_with_offset(input, -240), input);
+    }
+
+    // -----------------------------------------------------------------------
+    // schedule_once logic (no LM / Bot / Scheduler needed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn schedule_once_delay_seconds_positive_is_future() {
+        let fire_at = Utc::now() + chrono::Duration::seconds(300);
+        assert!(fire_at > Utc::now());
+    }
+
+    #[test]
+    fn schedule_once_delay_seconds_zero_is_not_future() {
+        let fire_at = Utc::now() + chrono::Duration::seconds(0);
+        assert!(fire_at <= Utc::now());
+    }
+
+    #[test]
+    fn schedule_once_fire_at_past_rejected() {
+        let past = "2020-01-01T00:00:00Z";
+        let dt = chrono::DateTime::parse_from_rfc3339(past)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(dt <= Utc::now(), "past date should be <= now");
+    }
+
+    #[test]
+    fn schedule_once_fire_at_future_accepted() {
+        let future = (Utc::now() + chrono::Duration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let dt = chrono::DateTime::parse_from_rfc3339(&future)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(dt > Utc::now());
+    }
+
+    #[test]
+    fn schedule_once_fire_at_invalid_format_errors() {
+        assert!(chrono::DateTime::parse_from_rfc3339("not-a-date").is_err());
+        assert!(chrono::DateTime::parse_from_rfc3339("2026-03-18 14:00:00").is_err()); // missing T
+    }
 }

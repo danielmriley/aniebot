@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
@@ -240,6 +241,7 @@ async fn post_to_lm_studio(
     let response = client
         .post(&url)
         .json(&payload)
+        .timeout(Duration::from_secs(900))
         .send()
         .await
         .context("Failed to reach LM Studio — is it running?")?;
@@ -350,9 +352,12 @@ fn build_system_prompt(core: &CoreMemory, memory_bullets: &str, episodic_entries
         format!("\n\n## Episodic Notes\n{}", notable.join("\n"))
     };
 
+    let now_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+
     format!(
-        "{core_block}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\n## Recent Memory\n{memory_bullets}{episodic_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\n## Recent Memory\n{memory_bullets}{episodic_section}",
         core_block = core.to_prompt_block(),
+        now_utc = now_utc,
         memory_bullets = memory_bullets,
         episodic_section = episodic_section,
     )
@@ -380,20 +385,82 @@ async fn try_run_heartbeat(
     bot: Bot,
     scheduler: Arc<SchedulerHandle>,
 ) -> anyhow::Result<()> {
-    let (core, episodic_entries) = tokio::join!(
+    let (core, all_recent) = tokio::join!(
         crate::core_memory::load(),
-        crate::episodic::load_recent(10),
+        crate::episodic::load_recent(50),
     );
     let core = core?;
-    let episodic_entries = episodic_entries?;
+    let all_recent = all_recent?;
 
-    let system_prompt = build_heartbeat_system_prompt(&core, &episodic_entries);
+    // Split recent episodic entries into general observations and prior heartbeat sends/checks.
+    // Only treat entries within the last 6 hours as "recent" — older entries shouldn't suppress
+    // legitimate new updates on the same topic.
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(6);
+    let recent_sends: Vec<_> = all_recent
+        .iter()
+        .filter(|e| e.tags.contains(&"heartbeat-sent".to_string()) && e.timestamp > cutoff)
+        .rev()
+        .take(5)
+        .cloned()
+        .collect();
+    let recent_checks: Vec<_> = all_recent
+        .iter()
+        .filter(|e| e.tags.contains(&"heartbeat-checked".to_string()) && e.timestamp > cutoff)
+        .rev()
+        .take(10)
+        .cloned()
+        .collect();
+
+    let system_prompt = build_heartbeat_system_prompt(&core, &all_recent, &recent_sends, &recent_checks);
     let messages = vec![
         LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
         LmMessage { role: "user".into(), content: Some("Heartbeat check. Review your interests and recent observations. If there is something worth sharing, send a message. Otherwise, stay silent.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 25).await
+    let sent = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 12).await?;
+
+    // Always write a heartbeat-checked entry with topics covered, so the next heartbeat cycle
+    // can skip re-researching interests that were already checked and found nothing new.
+    {
+        let interest_topics = core.interests.iter().map(|i| i.topic.as_str()).collect::<Vec<_>>().join(", ");
+        let content = if interest_topics.is_empty() {
+            "[heartbeat checked] No active interests.".to_string()
+        } else {
+            format!("[heartbeat checked] Topics checked: {interest_topics}")
+        };
+        let entry = crate::episodic::EpisodicEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            content,
+            tags: vec!["heartbeat-checked".to_string()],
+            importance: 1,
+            timestamp: chrono::Utc::now(),
+            promoted: false,
+        };
+        let _ = crate::episodic::append(&entry).await;
+    }
+
+    // Auto-log whatever was sent so the next heartbeat can see it and avoid repeating.
+    // Include the interest topics covered so the next cycle can match by name, not prose.
+    if let Some(text) = sent {
+        let interest_topics = core.interests.iter().map(|i| i.topic.as_str()).collect::<Vec<_>>().join(", ");
+        let summary = text.chars().take(150).collect::<String>();
+        let content = if interest_topics.is_empty() {
+            format!("[heartbeat sent] {summary}")
+        } else {
+            format!("[heartbeat sent] Topics covered: {interest_topics}. Summary: {summary}")
+        };
+        let entry = crate::episodic::EpisodicEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            content,
+            tags: vec!["heartbeat-sent".to_string()],
+            importance: 2,
+            timestamp: chrono::Utc::now(),
+            promoted: false,
+        };
+        let _ = crate::episodic::append(&entry).await;
+    }
+
+    Ok(())
 }
 
 /// Focused check for a single registered interest. Called by per-interest cron jobs.
@@ -431,7 +498,8 @@ async fn try_run_interest_check(
         LmMessage { role: "user".into(), content: Some(format!("Check for updates on: {}", interest.topic)), tool_calls: None, tool_call_id: None },
     ];
 
-    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 25).await
+    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 12).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -478,16 +546,38 @@ async fn try_run_consolidation(
         notable.join("\n")
     };
 
+    let high_sig: Vec<String> = entries
+        .iter()
+        .filter(|e| e.importance >= 4)
+        .rev()
+        .take(10)
+        .map(|e| format!("- [{}] (★{}) [{}] {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.tags.join(", "), e.content))
+        .collect();
+
+    let high_sig_section = if high_sig.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## High-Significance Episodes\n{}", high_sig.join("\n"))
+    };
+
+    let identity_question = if high_sig.is_empty() {
+        ""
+    } else {
+        "\n5. Did any high-significance event fundamentally change who you are or what you stand for? → update_core_memory(\"identity\", ...) [minimum surgical edit — add, revise, or remove only the specific clause that changed; do not rewrite wholesale]"
+    };
+
     let system_prompt = format!(
-        "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}\n\n\
+        "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}{high_sig_section}\n\n\
 You are in consolidation mode. Make a single, complete pass through these observations and call tools as needed:\n\
 1. Did you learn anything new or significant about the user? → update_core_memory(\"user_profile\", ...) [replace the full field with the updated text]\n\
 2. Did anything refine your beliefs? → update_core_memory(\"beliefs\", ...) [JSON array string]\n\
 3. Any observations worth preserving permanently? → remember(content, tags, 5)\n\
-4. Any interests to add or retire? → add_interest / retire_interest\n\
-\nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call nothing to end the consolidation. Do not call nothing before you have considered all four questions.",
+4. Any interests to add or retire? → add_interest / retire_interest{identity_question}\n\
+\nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call nothing to end the consolidation. Do not call nothing before you have considered all the questions above.",
         core_block = core.to_prompt_block(),
         episodic_block = episodic_block,
+        high_sig_section = high_sig_section,
+        identity_question = identity_question,
     );
 
     let messages = vec![
@@ -495,12 +585,38 @@ You are in consolidation mode. Make a single, complete pass through these observ
         LmMessage { role: "user".into(), content: Some("Consolidation cycle. Reflect and update as needed.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), 10).await?;
+    run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), 10).await?; // return value ignored for consolidation
 
-    // Record the consolidation timestamp.
-    let mut cm = crate::core_memory::load().await?;
-    cm.last_consolidation_at = Some(chrono::Utc::now());
-    crate::core_memory::save(&cm).await?;
+    // Reload core memory after LM pass (model may have added/retired interests).
+    // Apply health decay: -10 per consolidation pass for each interest whose topic
+    // isn't mentioned in any of the loaded episodic entries. Auto-retire at 0.
+    let mut cm_after = crate::core_memory::load().await?;
+    let mut retired_ids: Vec<String> = vec![];
+    for interest in cm_after.interests.iter_mut() {
+        let topic_lower = interest.topic.to_lowercase();
+        let mentioned = entries.iter().any(|e| e.content.to_lowercase().contains(&topic_lower));
+        if !mentioned {
+            interest.health = interest.health.saturating_sub(10);
+            if interest.health == 0 {
+                retired_ids.push(interest.id.clone());
+            }
+        } else {
+            interest.last_seen_date = chrono::Utc::now().date_naive().to_string();
+        }
+    }
+    cm_after.interests.retain(|i| !retired_ids.contains(&i.id));
+    for id in &retired_ids {
+        tracing::info!("Interest {id} health reached 0 — auto-retired");
+    }
+    cm_after.last_consolidation_at = Some(chrono::Utc::now());
+    crate::core_memory::save(&cm_after).await?;
+
+    // Promote high-importance episodic entries to archival.
+    match crate::episodic::promote_to_archival(4).await {
+        Ok(n) if n > 0 => tracing::info!("Promoted {n} episodic entries to archival"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("Archival promotion failed: {e}"),
+    }
 
     tracing::info!("Consolidation pass complete");
     Ok(())
@@ -508,11 +624,13 @@ You are in consolidation mode. Make a single, complete pass through these observ
 
 fn build_heartbeat_system_prompt(
     core: &CoreMemory,
-    entries: &[crate::episodic::EpisodicEntry],
+    all_entries: &[crate::episodic::EpisodicEntry],
+    recent_sends: &[crate::episodic::EpisodicEntry],
+    recent_checks: &[crate::episodic::EpisodicEntry],
 ) -> String {
-    let notable: Vec<String> = entries
+    let notable: Vec<String> = all_entries
         .iter()
-        .filter(|e| e.importance >= 3)
+        .filter(|e| e.importance >= 3 && !e.tags.contains(&"heartbeat-sent".to_string()))
         .rev()
         .take(5)
         .map(|e| format!("- [{}] (★{}) {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.content))
@@ -524,17 +642,44 @@ fn build_heartbeat_system_prompt(
         format!("\n\n## Recent Observations\n{}", notable.join("\n"))
     };
 
+    let sends_section = if recent_sends.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = recent_sends
+            .iter()
+            .map(|e| format!("- [{}] {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.content))
+            .collect();
+        format!("\n\n## Recently Sent to You\n{}", lines.join("\n"))
+    };
+
+    let checks_section = if recent_checks.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = recent_checks
+            .iter()
+            .map(|e| format!("- [{}] {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.content))
+            .collect();
+        format!("\n\n## Recently Checked (nothing new found)\n{}", lines.join("\n"))
+    };
+
     format!(
-        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}\n\nYou are in heartbeat mode. For each active interest above, use delegate_cli to check for any new or noteworthy developments. After researching, if you found something genuinely useful or timely, send it to the user with reply_to_user. If everything is quiet and there is nothing worth sharing, call nothing.",
+        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}{sends_section}{checks_section}\n\n\
+You are in heartbeat mode. Follow these steps in order:\n\
+1. Review '## Recently Sent to You' and '## Recently Checked' above. Any interest whose topic appears in either list was already covered within the last 6 hours — SKIP delegate_cli for it entirely. Do not re-research it.\n\
+2. For interests NOT recently covered or checked, use delegate_cli to check for new or noteworthy developments.\n\
+3. If your curiosity queue has items, pick ONE and investigate it with delegate_cli. If fully resolved, remove it with update_core_memory(\"curiosity_queue\", ...).\n\
+4. After completing any series of searches or tool calls, call reflect to record what you found and decide whether to continue. Only call reply_to_user if you found something genuinely new or useful. Default to nothing — silence is the right choice when nothing significant has changed.",
         core_block = core.to_prompt_block(),
         interests = core.interests_block(),
         episodic_section = episodic_section,
+        sends_section = sends_section,
+        checks_section = checks_section,
     )
 }
 
 /// Shared agentic loop used by heartbeat and interest checks.
 /// Loops up to `max_iters`, dispatching tool calls and accumulating context.
-/// Breaks silently on `nothing`, sends a message and breaks on `reply_to_user`.
+/// Returns the text that was sent to the user, if any.
 async fn run_agentic_loop(
     config: Arc<Config>,
     bot: Bot,
@@ -542,7 +687,7 @@ async fn run_agentic_loop(
     mut messages: Vec<LmMessage>,
     tool_defs: serde_json::Value,
     max_iters: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     // If a background model is configured, swap it in for CLI calls.
     let call_config: Arc<Config> = if config.background_copilot_model.is_some() {
         Arc::new(Config {
@@ -553,8 +698,13 @@ async fn run_agentic_loop(
         config.clone()
     };
 
+    let mut seen_reflections: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for iter in 0..max_iters {
+        tracing::info!("Agentic loop iter {}: awaiting LM...", iter + 1);
+        let lm_start = std::time::Instant::now();
         let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 4096).await?;
+        let lm_elapsed = lm_start.elapsed();
         let choice = response.choices.into_iter().next()
             .context("LM Studio returned no choices")?;
 
@@ -567,26 +717,46 @@ async fn run_agentic_loop(
             let raw = choice.message.content.unwrap_or_default();
             let text = strip_think_blocks(&raw).trim().to_string();
             if !text.is_empty() {
-                bot.send_message(ChatId(config.allowed_user_id as i64), text).await?;
+                bot.send_message(ChatId(config.allowed_user_id as i64), text.clone()).await?;
+                return Ok(Some(text));
             }
-            break;
+            return Ok(None);
         }
 
         let call = choice.message.tool_calls.into_iter().next().expect("checked non-empty");
         let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
         let tool_name = call.function.name.clone();
         let call_id = call.id.clone();
+        let raw_args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
 
-        tracing::info!("Agentic loop iter {}: tool={}", iter + 1, tool_name);
+        // Exact-duplicate backstop: if the model makes the identical reflect call twice, exit.
+        if tool_name == "reflect" {
+            if !seen_reflections.insert(call.function.arguments.clone()) {
+                tracing::warn!("Agentic loop early exit: duplicate reflect call at iter {}", iter + 1);
+                return Ok(None);
+            }
+        }
 
+        tracing::info!("Agentic loop iter {}: tool={} [LM: {:.1}s]", iter + 1, tool_name, lm_elapsed.as_secs_f32());
+
+        let dispatch_start = std::time::Instant::now();
         let result = tools::dispatch_tool_call(call_config.clone(), bot.clone(), scheduler.clone(), call).await?;
+        let dispatch_elapsed = dispatch_start.elapsed();
+        tracing::info!("Agentic loop iter {}: tool={} done [tool: {:.1}s]", iter + 1, tool_name, dispatch_elapsed.as_secs_f32());
 
         if tool_name == "reply_to_user" {
-            bot.send_message(ChatId(config.allowed_user_id as i64), result).await?;
-            break;
+            bot.send_message(ChatId(config.allowed_user_id as i64), result.clone()).await?;
+            return Ok(Some(result));
         }
         if tool_name == "nothing" {
-            break;
+            return Ok(None);
+        }
+        if tool_name == "reflect" {
+            if raw_args["done"].as_bool().unwrap_or(false) {
+                tracing::info!("Agentic loop: reflect concluded at iter {}", iter + 1);
+                return Ok(None);
+            }
+            // done=false: observation goes into context below, loop continues
         }
 
         tracing::debug!("Agentic loop iter {} result: {:.500}", iter + 1, result);
@@ -606,7 +776,7 @@ async fn run_agentic_loop(
         });
     }
 
-    Ok(())
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,8 +802,8 @@ async fn run_memory_eval(
                     "properties": {
                         "section": {
                             "type": "string",
-                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
-                            "description": "Which section to update. user_profile for facts about the user; beliefs for your evolving worldview; identity for your self-description; curiosity_queue for topics to explore."
+                            "enum": ["beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to update. user_profile for facts about the user; beliefs for your evolving worldview; curiosity_queue for topics you want to investigate."
                         },
                         "content": {
                             "type": "string",
@@ -664,24 +834,37 @@ async fn run_memory_eval(
         current.beliefs.iter().map(|b| format!("- {b}")).collect::<Vec<_>>().join("\n")
     };
 
+    let curiosity_display = if current.curiosity_queue.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        current.curiosity_queue.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n")
+    };
+
     let system_msg = format!(
         "You are maintaining persistent memory for AnieBot, a personal AI assistant.\n\n\
          ## Current memory\n\
          **User profile:** {user_profile}\n\
-         **Beliefs:** {beliefs}\n\n\
+         **Beliefs:** {beliefs}\n\
+         **Curiosity queue:** {curiosity}\n\n\
          ## Your task\n\
          Review the exchange below. Did it reveal anything NEW not already captured above?\n\n\
-         Update if the exchange contained ANY of these:\n\
+         Update user_profile if the exchange contained ANY of these:\n\
          - User's name, location, job, field, or life stage\n\
          - User's achievements, projects, relationships, or preferences\n\
-         - A clear opinion or belief you formed during this conversation\n\
          - Anything that defines who the user is or what matters to them\n\n\
+         Update beliefs if you reached a conclusion or formed an opinion during this exchange — \
+         about the world, technology, society, or this user's situation. Be direct: record the belief \
+         as a concise first-person statement (e.g. \"Async Rust is worth the complexity for long-lived services\").\n\n\
+         Update curiosity_queue if something came up that you genuinely want to investigate or learn more about — \
+         an unresolved question, an interesting topic, something the user mentioned that you'd like to follow up on. \
+         Add the full existing list plus the new item as a JSON array.\n\n\
          Call `nothing` only for pure small talk, acknowledgements, or follow-ups \
          that add no new facts (e.g. \"thanks\", \"got it\", \"that makes sense\").\n\n\
          When updating user_profile, write a concise prose summary that PRESERVES \
          existing facts and adds the new ones — do not discard what is already known.",
         user_profile = current.user_profile,
         beliefs = beliefs_display,
+        curiosity = curiosity_display,
     );
 
     let exchange = format!("User: {user_msg}\nAssistant: {assistant_reply}");

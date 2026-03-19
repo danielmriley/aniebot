@@ -4,6 +4,14 @@ use anyhow::Result;
 use teloxide::Bot;
 use tracing_subscriber::EnvFilter;
 
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
+    }
+}
+
 mod bot;
 mod cli_wrapper;
 mod config;
@@ -22,6 +30,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
+        .with_timer(LocalTimer)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

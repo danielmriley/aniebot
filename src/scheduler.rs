@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
+use chrono::Utc;
+
 use crate::config::Config;
 use crate::core_memory;
 use crate::orchestrator;
@@ -319,18 +321,39 @@ async fn create_and_register_job(
     let task = entry.task.clone();
     let chat_id = config.allowed_user_id as i64;
 
-    let job = Job::new_async(entry.cron.as_str(), move |_uuid, _lock| {
-        let bot = bot.clone();
-        let cfg = config.clone();
-        let task = task.clone();
-        Box::pin(async move {
-            tracing::info!("Dynamic job firing — task: {:?}", task);
-            let reply = orchestrator::execute_scheduled_task(cfg.clone(), &task).await;
-            if let Err(e) = bot.send_message(ChatId(chat_id), reply).await {
-                tracing::error!("Failed to send dynamic job reply: {}", e);
-            }
-        })
-    })?;
+    let job = if let Some(fire_at) = entry.fire_once_at {
+        let remaining = (fire_at - Utc::now())
+            .to_std()
+            .map_err(|_| anyhow::anyhow!("schedule_once target time is in the past"))?;
+        let cleanup_id = entry.id.clone();
+        Job::new_one_shot_async(remaining, move |_uuid, _lock| {
+            let bot = bot.clone();
+            let cfg = config.clone();
+            let task = task.clone();
+            let cleanup_id = cleanup_id.clone();
+            Box::pin(async move {
+                tracing::info!("One-shot job firing — task: {:?}", task);
+                let reply = orchestrator::execute_scheduled_task(cfg.clone(), &task).await;
+                if let Err(e) = bot.send_message(ChatId(chat_id), reply).await {
+                    tracing::error!("Failed to send one-shot job reply: {}", e);
+                }
+                let _ = schedule_store::remove(&cleanup_id).await;
+            })
+        })?
+    } else {
+        Job::new_async(entry.cron.as_str(), move |_uuid, _lock| {
+            let bot = bot.clone();
+            let cfg = config.clone();
+            let task = task.clone();
+            Box::pin(async move {
+                tracing::info!("Dynamic job firing — task: {:?}", task);
+                let reply = orchestrator::execute_scheduled_task(cfg.clone(), &task).await;
+                if let Err(e) = bot.send_message(ChatId(chat_id), reply).await {
+                    tracing::error!("Failed to send dynamic job reply: {}", e);
+                }
+            })
+        })?
+    };
 
     let uuid = job.guid();
     sched.add(job).await?;
@@ -358,6 +381,11 @@ async fn load_and_add_persisted_jobs(
 
     tracing::info!("Loading {} persisted dynamic job(s)", entries.len());
     for entry in entries {
+        if entry.fire_once_at.map_or(false, |t| t <= Utc::now()) {
+            tracing::info!("One-shot job '{}' expired while offline — removing", entry.label);
+            let _ = schedule_store::remove(&entry.id).await;
+            continue;
+        }
         let label = entry.label.clone();
         let id = entry.id.clone();
         match create_and_register_job(sched, bot.clone(), config.clone(), &entry)

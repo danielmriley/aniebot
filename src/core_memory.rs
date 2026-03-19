@@ -22,6 +22,9 @@ pub struct CoreMemory {
     /// Timestamp of the last consolidation pass. `None` means never consolidated.
     #[serde(default)]
     pub last_consolidation_at: Option<chrono::DateTime<Utc>>,
+    /// Current active task or project being worked on. Injected into every system prompt.
+    #[serde(default)]
+    pub current_task: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -44,6 +47,7 @@ impl Default for CoreMemory {
             interests: Vec::new(),
             curiosity_queue: Vec::new(),
             last_consolidation_at: None,
+            current_task: None,
         }
     }
 }
@@ -72,12 +76,26 @@ impl CoreMemory {
                 .join("\n")
         };
 
+        let task_block = match &self.current_task {
+            Some(t) => format!("\n\n## Current Task\n{t}"),
+            None => String::new(),
+        };
+
         format!(
-            "## Who I Am\n{identity}\n\n\
+            "## What I Am\n\
+             I am AnieBot, a personal AI assistant running inside a custom Rust/tokio harness built by Daniel. \
+             I communicate with Daniel via Telegram. Inference is handled by a local LM Studio instance. \
+             My available tools are: recall, remember, delegate_cli, schedule_once, schedule_cron, \
+             set_task, clear_task, reflect, add_interest, retire_interest, update_core_memory, nothing.\n\n\
+             ## Tone & Style\n\
+             Be concise and direct. Do not append unsolicited summaries to messages Daniel did not ask to be summarized. \
+             A brief acknowledgment like \"Noted.\" is fine; do not repeat back what was just said.\n\n\
+             ## Who I Am\n{identity}{task_block}\n\n\
              ## Current Beliefs\n{beliefs}\n\n\
              ## What I Know About You\n{user_profile}\n\n\
              ## Things I'm Curious About\n{curiosity}",
             identity = self.identity,
+            task_block = task_block,
             beliefs = beliefs,
             user_profile = self.user_profile,
             curiosity = curiosity,
@@ -171,5 +189,19 @@ pub async fn add_interest(
 pub async fn retire_interest(id: &str) -> Result<()> {
     let mut cm = load().await?;
     cm.interests.retain(|e| e.id != id);
+    save(&cm).await
+}
+
+/// Set the current active task description.
+pub async fn set_task(description: &str) -> Result<()> {
+    let mut cm = load().await?;
+    cm.current_task = Some(description.to_string());
+    save(&cm).await
+}
+
+/// Clear the current active task.
+pub async fn clear_task() -> Result<()> {
+    let mut cm = load().await?;
+    cm.current_task = None;
     save(&cm).await
 }
