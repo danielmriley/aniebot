@@ -166,12 +166,17 @@ pub async fn update_section(section: &str, content: &str) -> Result<()> {
 }
 
 /// Create a new interest, append it to core memory, and return it.
+/// Returns `Ok(None)` if an interest with the same topic (case-insensitive) already exists.
 pub async fn add_interest(
     topic: &str,
     description: &str,
     check_cron: Option<String>,
-) -> Result<Interest> {
+) -> Result<Option<Interest>> {
     let mut cm = load().await?;
+    let topic_lower = topic.trim().to_lowercase();
+    if cm.interests.iter().any(|i| i.topic.trim().to_lowercase() == topic_lower) {
+        return Ok(None);
+    }
     let interest = Interest {
         id: Uuid::new_v4().to_string(),
         topic: topic.to_string(),
@@ -182,7 +187,7 @@ pub async fn add_interest(
     };
     cm.interests.push(interest.clone());
     save(&cm).await?;
-    Ok(interest)
+    Ok(Some(interest))
 }
 
 /// Remove an interest by ID from core memory.

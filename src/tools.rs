@@ -771,13 +771,17 @@ pub async fn dispatch_tool_call(
                 }
             };
             let has_cron = check_cron.is_some();
-            let interest = core_memory::add_interest(topic, description, check_cron).await?;
-            if has_cron {
-                if let Err(e) = crate::scheduler::add_interest_job(&scheduler, bot.clone(), config.clone(), interest).await {
-                    tracing::warn!("Failed to register interest cron job: {e}");
+            match core_memory::add_interest(topic, description, check_cron).await? {
+                None => Ok(format!("\u{2713} Interest already exists: {topic}")),
+                Some(interest) => {
+                    if has_cron {
+                        if let Err(e) = crate::scheduler::add_interest_job(&scheduler, bot.clone(), config.clone(), interest).await {
+                            tracing::warn!("Failed to register interest cron job: {e}");
+                        }
+                    }
+                    Ok(format!("\u{2713} Interest registered: {topic}"))
                 }
             }
-            Ok(format!("\u{2713} Interest registered: {topic}"))
         }
         "retire_interest" => {
             let id = args["interest_id"].as_str()

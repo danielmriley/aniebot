@@ -570,9 +570,10 @@ async fn try_run_consolidation(
         "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}{high_sig_section}\n\n\
 You are in consolidation mode. Make a single, complete pass through these observations and call tools as needed:\n\
 1. Did you learn anything new or significant about the user? → update_core_memory(\"user_profile\", ...) [replace the full field with the updated text]\n\
-2. Did anything refine your beliefs? → update_core_memory(\"beliefs\", ...) [JSON array string]\n\
+2. Did anything refine your beliefs or opinions? → update_core_memory(\"beliefs\", ...) [JSON array string, e.g. \"[\\\"Formal verification is underutilized in industry\\\", \\\"Daniel values deep work over shallow multitasking\\\"]\"] Be direct — record concrete first-person conclusions, not vague observations.\n\
 3. Any observations worth preserving permanently? → remember(content, tags, 5)\n\
-4. Any interests to add or retire? → add_interest / retire_interest{identity_question}\n\
+4. Did any unresolved questions or interesting topics come up worth investigating later? → update_core_memory(\"curiosity_queue\", ...) [JSON array of short topic strings, e.g. \"[\\\"How does Lean 4 compare to Coq for software verification?\\\"]\"]. Add to existing items, don't replace them.\n\
+5. Any interests to add or retire? → add_interest / retire_interest{identity_question}\n\
 \nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call nothing to end the consolidation. Do not call nothing before you have considered all the questions above.",
         core_block = core.to_prompt_block(),
         episodic_block = episodic_block,
