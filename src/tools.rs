@@ -336,8 +336,8 @@ pub fn consolidation_tool_definitions() -> serde_json::Value {
                     "properties": {
                         "section": {
                             "type": "string",
-                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
-                            "description": "Which section to overwrite."
+                            "enum": ["beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to overwrite. Note: 'identity' is read-only and cannot be changed during consolidation."
                         },
                         "content": {
                             "type": "string",

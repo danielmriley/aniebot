@@ -480,12 +480,12 @@ async fn try_run_consolidation(
 
     let system_prompt = format!(
         "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}\n\n\
-You are in consolidation mode. Reflect on the observations above and answer these questions through tool calls:\n\
-1. Did you learn anything new or significant about the user that should update their profile? → update_core_memory(\"user_profile\", ...)\n\
-2. Did anything meaningfully refine or change your beliefs? → update_core_memory(\"beliefs\", ...)\n\
-3. Are there observations worth preserving permanently as high-importance memories? → remember(content, tags, 5)\n\
-4. Are your tracked interests still current, or should any be added/retired? → add_interest / retire_interest\n\
-\nBe conservative — only make changes if the evidence clearly warrants it. When done, call nothing.",
+You are in consolidation mode. Make a single, complete pass through these observations and call tools as needed:\n\
+1. Did you learn anything new or significant about the user? → update_core_memory(\"user_profile\", ...) [replace the full field with the updated text]\n\
+2. Did anything refine your beliefs? → update_core_memory(\"beliefs\", ...) [JSON array string]\n\
+3. Any observations worth preserving permanently? → remember(content, tags, 5)\n\
+4. Any interests to add or retire? → add_interest / retire_interest\n\
+\nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call nothing to end the consolidation. Do not call nothing before you have considered all four questions.",
         core_block = core.to_prompt_block(),
         episodic_block = episodic_block,
     );
