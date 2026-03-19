@@ -406,14 +406,27 @@ async fn create_and_register_interest_job(
     handle: Arc<SchedulerHandle>,
     interest: core_memory::Interest,
 ) {
-    let Some(ref cron) = interest.check_cron else {
+    let Some(ref raw_cron) = interest.check_cron else {
         return; // global heartbeat covers this interest
+    };
+    if raw_cron.trim().is_empty() {
+        return; // stored as "" — treat as no dedicated cron
+    }
+    // Normalize: promote 5-field → 6-field Quartz (tokio-cron-scheduler requires 6 fields).
+    let cron_owned;
+    let cron = match raw_cron.split_whitespace().count() {
+        5 => {
+            cron_owned = format!("0 {}", raw_cron);
+            tracing::info!("Interest '{}': auto-promoted cron to 6-field: {}", interest.topic, cron_owned);
+            cron_owned.as_str()
+        }
+        _ => raw_cron.as_str(),
     };
     let interest_id = interest.id.clone();
     let topic = interest.topic.clone();
     let stable_id = interest.id.clone();
 
-    let job = Job::new_async(cron.as_str(), move |_uuid, _lock| {
+    let job = Job::new_async(cron, move |_uuid, _lock| {
         let bot = bot.clone();
         let cfg = config.clone();
         let handle = handle.clone();

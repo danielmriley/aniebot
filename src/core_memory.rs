@@ -19,6 +19,9 @@ pub struct CoreMemory {
     /// conversation system prompt to avoid cluttering the context.
     pub interests: Vec<Interest>,
     pub curiosity_queue: Vec<String>,
+    /// Timestamp of the last consolidation pass. `None` means never consolidated.
+    #[serde(default)]
+    pub last_consolidation_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -40,6 +43,7 @@ impl Default for CoreMemory {
             user_profile: "(no profile yet — will be populated as I learn about you)".into(),
             interests: Vec::new(),
             curiosity_queue: Vec::new(),
+            last_consolidation_at: None,
         }
     }
 }

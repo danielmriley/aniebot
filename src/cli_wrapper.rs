@@ -1,11 +1,19 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use crate::config::Config;
 
+/// Global mutex ensuring only one Copilot CLI process runs at a time.
+/// Concurrent invocations corrupt Copilot's shared session file.
+static CLI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
 pub async fn run(config: &Config, task: &str) -> Result<String> {
+    let _guard = CLI_LOCK.get_or_init(|| Mutex::new(())).lock().await;
+
     let mut cmd = Command::new("copilot");
     cmd.arg("-p")
         .arg(task)

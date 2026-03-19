@@ -15,6 +15,7 @@ pub struct Config {
     pub copilot_model: Option<String>,
     pub heartbeat_cron: String,
     pub background_copilot_model: Option<String>,
+    pub consolidation_threshold: usize,
 }
 
 impl Config {
@@ -49,6 +50,10 @@ impl Config {
         let heartbeat_cron = std::env::var("HEARTBEAT_CRON")
             .unwrap_or_else(|_| "0 0 * * * *".into());
         let background_copilot_model = std::env::var("BACKGROUND_COPILOT_MODEL").ok();
+        let consolidation_threshold = std::env::var("CONSOLIDATION_THRESHOLD")
+            .unwrap_or_else(|_| "15".into())
+            .parse::<usize>()
+            .context("CONSOLIDATION_THRESHOLD must be a valid integer")?;
 
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
@@ -67,6 +72,7 @@ impl Config {
             copilot_model,
             heartbeat_cron,
             background_copilot_model,
+            consolidation_threshold,
         })
     }
 }

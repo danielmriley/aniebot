@@ -164,7 +164,7 @@ async fn try_process(
     // Call LM Studio with tool definitions.
     let tool_defs = tools::tool_definitions();
     let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 1024).await?;
-    let (reply, assistant_turns) = dispatch_response(config.clone(), bot, scheduler, response).await?;
+    let (reply, assistant_turns) = dispatch_response(config.clone(), bot.clone(), scheduler.clone(), response).await?;
 
     // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
     {
@@ -189,6 +189,28 @@ async fn try_process(
     }
     if let Err(e) = memory::store_interaction(chat_id, user_input, &reply).await {
         tracing::warn!("Failed to write memory log: {}", e);
+    }
+
+    // Consolidation trigger — fire-and-forget if enough new episodic entries have
+    // accumulated since the last consolidation pass.
+    {
+        let config_cons = config.clone();
+        let bot_cons = bot.clone();
+        let scheduler_cons = scheduler.clone();
+        tokio::spawn(async move {
+            let since = match crate::core_memory::load().await {
+                Ok(cm) => cm.last_consolidation_at.unwrap_or(chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()),
+                Err(_) => return,
+            };
+            match crate::episodic::count_since(since).await {
+                Ok(n) if n >= config_cons.consolidation_threshold => {
+                    tracing::info!("Consolidation triggered ({n} entries since last pass)");
+                    run_consolidation(config_cons, bot_cons, scheduler_cons).await;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("count_since failed: {e}"),
+            }
+        });
     }
 
     Ok(reply)
@@ -412,6 +434,78 @@ async fn try_run_interest_check(
     run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 25).await
 }
 
+// ---------------------------------------------------------------------------
+// Consolidation
+// ---------------------------------------------------------------------------
+
+/// Fire-and-forget consolidation pass. Called from try_process when the episodic
+/// entry count since last consolidation exceeds CONSOLIDATION_THRESHOLD.
+pub async fn run_consolidation(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+) {
+    if let Err(e) = try_run_consolidation(config, bot, scheduler).await {
+        tracing::warn!("Consolidation error: {e}");
+    }
+}
+
+async fn try_run_consolidation(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+) -> anyhow::Result<()> {
+    tracing::info!("Consolidation pass starting");
+
+    let (core, entries) = tokio::join!(
+        crate::core_memory::load(),
+        crate::episodic::load_recent(20),
+    );
+    let core = core?;
+    let entries = entries?;
+
+    let notable: Vec<String> = entries
+        .iter()
+        .filter(|e| e.importance >= 2)
+        .rev()
+        .take(20)
+        .map(|e| format!("- [{}] (★{}) [{}] {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.tags.join(", "), e.content))
+        .collect();
+
+    let episodic_block = if notable.is_empty() {
+        "(no recent observations)".to_string()
+    } else {
+        notable.join("\n")
+    };
+
+    let system_prompt = format!(
+        "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}\n\n\
+You are in consolidation mode. Reflect on the observations above and answer these questions through tool calls:\n\
+1. Did you learn anything new or significant about the user that should update their profile? → update_core_memory(\"user_profile\", ...)\n\
+2. Did anything meaningfully refine or change your beliefs? → update_core_memory(\"beliefs\", ...)\n\
+3. Are there observations worth preserving permanently as high-importance memories? → remember(content, tags, 5)\n\
+4. Are your tracked interests still current, or should any be added/retired? → add_interest / retire_interest\n\
+\nBe conservative — only make changes if the evidence clearly warrants it. When done, call nothing.",
+        core_block = core.to_prompt_block(),
+        episodic_block = episodic_block,
+    );
+
+    let messages = vec![
+        LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
+        LmMessage { role: "user".into(), content: Some("Consolidation cycle. Reflect and update as needed.".into()), tool_calls: None, tool_call_id: None },
+    ];
+
+    run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), 10).await?;
+
+    // Record the consolidation timestamp.
+    let mut cm = crate::core_memory::load().await?;
+    cm.last_consolidation_at = Some(chrono::Utc::now());
+    crate::core_memory::save(&cm).await?;
+
+    tracing::info!("Consolidation pass complete");
+    Ok(())
+}
+
 fn build_heartbeat_system_prompt(
     core: &CoreMemory,
     entries: &[crate::episodic::EpisodicEntry],
@@ -431,7 +525,7 @@ fn build_heartbeat_system_prompt(
     };
 
     format!(
-        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}\n\nYou are in heartbeat mode. Review your interests and recent observations. Silence is the default — only send a message if you have something genuinely useful or timely to share with the user.",
+        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}\n\nYou are in heartbeat mode. For each active interest above, use delegate_cli to check for any new or noteworthy developments. After researching, if you found something genuinely useful or timely, send it to the user with reply_to_user. If everything is quiet and there is nothing worth sharing, call nothing.",
         core_block = core.to_prompt_block(),
         interests = core.interests_block(),
         episodic_section = episodic_section,
@@ -494,6 +588,8 @@ async fn run_agentic_loop(
         if tool_name == "nothing" {
             break;
         }
+
+        tracing::debug!("Agentic loop iter {} result: {:.500}", iter + 1, result);
 
         // Push tool call + result into context and continue.
         messages.push(LmMessage {

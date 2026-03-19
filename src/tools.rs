@@ -322,6 +322,89 @@ pub fn heartbeat_tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// Tool definitions for the consolidation reflection pass.
+/// Allows the model to update core memory, persist observations, manage interests.
+pub fn consolidation_tool_definitions() -> serde_json::Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "update_core_memory",
+                "description": "Update a section of your core memory document.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "section": {
+                            "type": "string",
+                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to overwrite."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New content. Plain text for identity/user_profile; JSON array string for beliefs/curiosity_queue."
+                        }
+                    },
+                    "required": ["section", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": "Persist an important observation to episodic memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The observation to record." },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Categorization tags." },
+                        "importance": { "type": "integer", "description": "Importance 1-5. Use 5 for consolidation-promoted facts." }
+                    },
+                    "required": ["content", "importance"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_interest",
+                "description": "Register a new topic to track proactively.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": { "type": "string", "description": "Short name for the interest." },
+                        "description": { "type": "string", "description": "What to look for." },
+                        "check_cron": { "type": "string", "description": "Optional cron for dedicated checks." }
+                    },
+                    "required": ["topic", "description"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "retire_interest",
+                "description": "Remove a previously registered interest by its ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "interest_id": { "type": "string", "description": "UUID of the interest to retire." }
+                    },
+                    "required": ["interest_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nothing",
+                "description": "Nothing to update from this consolidation cycle.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Tool dispatch
 // ---------------------------------------------------------------------------
@@ -472,7 +555,29 @@ pub async fn dispatch_tool_call(
                 .context("add_interest missing 'topic' argument")?;
             let description = args["description"].as_str()
                 .context("add_interest missing 'description' argument")?;
-            let check_cron = args["check_cron"].as_str().map(String::from);
+            // Normalize the optional cron: promote 5-field → 6-field Quartz, then UTC-shift.
+            // Treat absent OR empty string as no cron (LLMs sometimes emit "" for optional fields).
+            let check_cron: Option<String> = match args["check_cron"].as_str() {
+                None | Some("") => None,
+                Some(raw) => {
+                    let promoted = match raw.split_whitespace().count() {
+                        5 => {
+                            let s = format!("0 {}", raw);
+                            tracing::info!("add_interest: auto-promoted cron to 6-field: {}", s);
+                            s
+                        }
+                        6 => raw.to_string(),
+                        _ => {
+                            return Ok(format!(
+                                "❌ Invalid cron `{}` for interest: expected 5 or 6 fields.",
+                                raw
+                            ));
+                        }
+                    };
+                    let utc = cron_local_to_utc(&promoted);
+                    Some(utc)
+                }
+            };
             let has_cron = check_cron.is_some();
             let interest = core_memory::add_interest(topic, description, check_cron).await?;
             if has_cron {
