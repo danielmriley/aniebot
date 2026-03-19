@@ -9,6 +9,7 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::core_memory;
 use crate::orchestrator;
 use crate::schedule_store::{self, ScheduleEntry};
 
@@ -35,6 +36,11 @@ enum ScheduleCommand {
     Remove {
         entry_id: String,
         reply_tx: oneshot::Sender<bool>,
+    },
+    AddInterestJob {
+        interest: core_memory::Interest,
+        bot: Bot,
+        config: Arc<Config>,
     },
 }
 
@@ -71,6 +77,21 @@ pub async fn add_dynamic_job(
     Ok(())
 }
 
+/// Register a per-interest cron job. No-op if the interest has no check_cron.
+pub async fn add_interest_job(
+    handle: &SchedulerHandle,
+    bot: Bot,
+    config: Arc<Config>,
+    interest: core_memory::Interest,
+) -> anyhow::Result<()> {
+    handle
+        .command_tx
+        .send(ScheduleCommand::AddInterestJob { interest, bot, config })
+        .await
+        .map_err(|_| anyhow::anyhow!("Scheduler worker is not running"))?;
+    Ok(())
+}
+
 /// Send a "remove job" command and wait for a boolean confirmation.
 /// Returns `true` if a job with the given stable entry ID was found and removed.
 pub async fn remove_dynamic_job(
@@ -95,7 +116,7 @@ pub async fn remove_dynamic_job(
 
 async fn scheduler_worker(
     mut rx: mpsc::Receiver<ScheduleCommand>,
-    _handle: Arc<SchedulerHandle>,
+    handle: Arc<SchedulerHandle>,
     bot: Bot,
     config: Arc<Config>,
 ) {
@@ -112,6 +133,8 @@ async fn scheduler_worker(
 
     add_morning_summary_job(&sched, bot.clone(), config.clone()).await;
     add_health_check_job(&sched, bot.clone(), config.clone()).await;
+    add_heartbeat_job(&sched, bot.clone(), config.clone(), handle.clone()).await;
+    load_and_add_interest_jobs(&sched, &mut id_map, bot.clone(), config.clone(), handle.clone()).await;
     load_and_add_persisted_jobs(&sched, &mut id_map, bot.clone(), config.clone())
         .await;
 
@@ -147,6 +170,9 @@ async fn scheduler_worker(
                     false
                 };
                 let _ = reply_tx.send(found);
+            }
+            ScheduleCommand::AddInterestJob { interest, bot, config } => {
+                create_and_register_interest_job(&sched, &mut id_map, bot, config, handle.clone(), interest).await;
             }
         }
     }
@@ -234,6 +260,36 @@ async fn add_health_check_job(sched: &JobScheduler, bot: Bot, config: Arc<Config
     }
 }
 
+async fn add_heartbeat_job(
+    sched: &JobScheduler,
+    bot: Bot,
+    config: Arc<Config>,
+    handle: Arc<SchedulerHandle>,
+) {
+    let cron_expr = config.heartbeat_cron.clone();
+
+    let job = Job::new_async(cron_expr.as_str(), move |_uuid, _lock| {
+        let bot = bot.clone();
+        let cfg = config.clone();
+        let handle = handle.clone();
+        Box::pin(async move {
+            tracing::info!("Heartbeat firing");
+            orchestrator::run_heartbeat(cfg, bot, handle).await;
+        })
+    });
+
+    match job {
+        Ok(j) => {
+            if let Err(e) = sched.add(j).await {
+                tracing::error!("Failed to add heartbeat job: {}", e);
+            } else {
+                tracing::info!("Heartbeat job registered (cron: {})", cron_expr);
+            }
+        }
+        Err(e) => tracing::error!("Failed to create heartbeat job (bad cron '{}'?): {}", cron_expr, e),
+    }
+}
+
 /// Returns true if LM Studio responds with a 2xx status code.
 async fn ping_lm_studio(lm_url: &str) -> bool {
     let url = format!("{}/v1/models", lm_url);
@@ -312,6 +368,73 @@ async fn load_and_add_persisted_jobs(
             }
             Err(e) => tracing::warn!("Skipping persisted job '{}': {}", label, e),
         }
+    }
+}
+
+/// At startup, register a dedicated cron job for every saved interest that has
+/// a `check_cron` value. Interests without a cron are covered by the global heartbeat.
+async fn load_and_add_interest_jobs(
+    sched: &JobScheduler,
+    id_map: &mut HashMap<String, Uuid>,
+    bot: Bot,
+    config: Arc<Config>,
+    handle: Arc<SchedulerHandle>,
+) {
+    let core = match core_memory::load().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Could not load core memory for interest jobs: {}", e);
+            return;
+        }
+    };
+    let interests_with_cron: Vec<_> = core.interests.into_iter().filter(|i| i.check_cron.is_some()).collect();
+    if interests_with_cron.is_empty() {
+        return;
+    }
+    tracing::info!("Registering {} interest job(s) from core memory", interests_with_cron.len());
+    for interest in interests_with_cron {
+        create_and_register_interest_job(sched, id_map, bot.clone(), config.clone(), handle.clone(), interest).await;
+    }
+}
+
+/// Create and register a cron job for a single interest. No-op if `check_cron` is None.
+async fn create_and_register_interest_job(
+    sched: &JobScheduler,
+    id_map: &mut HashMap<String, Uuid>,
+    bot: Bot,
+    config: Arc<Config>,
+    handle: Arc<SchedulerHandle>,
+    interest: core_memory::Interest,
+) {
+    let Some(ref cron) = interest.check_cron else {
+        return; // global heartbeat covers this interest
+    };
+    let interest_id = interest.id.clone();
+    let topic = interest.topic.clone();
+    let stable_id = interest.id.clone();
+
+    let job = Job::new_async(cron.as_str(), move |_uuid, _lock| {
+        let bot = bot.clone();
+        let cfg = config.clone();
+        let handle = handle.clone();
+        let id = interest_id.clone();
+        Box::pin(async move {
+            tracing::info!("Interest check firing for: {}", id);
+            orchestrator::run_interest_check(cfg, bot, handle, id).await;
+        })
+    });
+
+    match job {
+        Ok(j) => {
+            let uuid = j.guid();
+            if let Err(e) = sched.add(j).await {
+                tracing::error!("Failed to add interest job for '{}': {}", topic, e);
+            } else {
+                tracing::info!("Interest job registered for '{}' (cron: {})", topic, cron);
+                id_map.insert(stable_id, uuid);
+            }
+        }
+        Err(e) => tracing::error!("Failed to create interest job for '{}' (bad cron?): {}", topic, e),
     }
 }
 

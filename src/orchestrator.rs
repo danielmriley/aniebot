@@ -7,6 +7,7 @@ use serde_json::json;
 use teloxide::prelude::*;
 
 use crate::config::Config;
+use crate::core_memory::CoreMemory;
 use crate::memory::{self, ConversationMessage};
 use crate::scheduler::SchedulerHandle;
 use crate::tools;
@@ -84,11 +85,11 @@ pub async fn execute_scheduled_task(config: Arc<Config>, task: &str) -> String {
 }
 
 async fn try_execute_scheduled_task(config: Arc<Config>, task: &str) -> anyhow::Result<String> {
-    let personality = load_personality().await?;
+    let core = crate::core_memory::load().await?;
 
     let system_prompt = format!(
-        "{personality}\n\nYou are executing a scheduled task. Respond directly with your message — plain text, no JSON.",
-        personality = personality,
+        "{core_block}\n\nYou are executing a scheduled task. Respond directly with your message — plain text, no JSON.",
+        core_block = core.to_prompt_block(),
     );
 
     let messages = vec![
@@ -97,7 +98,7 @@ async fn try_execute_scheduled_task(config: Arc<Config>, task: &str) -> anyhow::
     ];
 
     // Plain completion — no tools offered, just direct text output.
-    let response = post_to_lm_studio(&config, &messages, None).await?;
+    let response = post_to_lm_studio(&config, &messages, None, 1024).await?;
     let choice = response.choices.into_iter().next()
         .context("LM Studio returned no choices")?;
     let raw = choice.message.content.unwrap_or_default();
@@ -121,10 +122,11 @@ async fn try_process(
     }
 
     // Load full context.
-    let (personality, history, recent_memory) = tokio::try_join!(
-        load_personality(),
+    let (core, history, recent_memory, recent_episodic) = tokio::try_join!(
+        crate::core_memory::load(),
         memory::load_history(chat_id),
         memory::load_recent_memory(MEMORY_ENTRIES),
+        crate::episodic::load_recent(10),
     )?;
 
     // Build windowed history slice.
@@ -144,7 +146,7 @@ async fn try_process(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let system_prompt = build_system_prompt(&personality, &memory_bullets);
+    let system_prompt = build_system_prompt(&core, &memory_bullets, &recent_episodic);
 
     // Build messages array.
     let mut messages: Vec<LmMessage> = Vec::with_capacity(1 + history_window.len() + 1);
@@ -161,8 +163,20 @@ async fn try_process(
 
     // Call LM Studio with tool definitions.
     let tool_defs = tools::tool_definitions();
-    let response = post_to_lm_studio(&config, &messages, Some(&tool_defs)).await?;
+    let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 1024).await?;
     let (reply, assistant_turns) = dispatch_response(config.clone(), bot, scheduler, response).await?;
+
+    // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
+    {
+        let config_eval = config.clone();
+        let user_snapshot = user_input.to_string();
+        let reply_snapshot = reply.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_memory_eval(config_eval, user_snapshot, reply_snapshot).await {
+                tracing::warn!("Memory eval pass failed: {e}");
+            }
+        });
+    }
 
     // Persist the user turn + whatever history entries dispatch_response produced.
     let now = Utc::now();
@@ -184,6 +198,7 @@ async fn post_to_lm_studio(
     config: &Config,
     messages: &[LmMessage],
     tools: Option<&serde_json::Value>,
+    max_tokens: u32,
 ) -> anyhow::Result<LmCompletionResponse> {
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", config.lm_studio_url);
@@ -192,7 +207,7 @@ async fn post_to_lm_studio(
         "model": config.model_name,
         "messages": messages,
         "temperature": 0.0,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
     });
 
     if let Some(t) = tools {
@@ -227,13 +242,23 @@ async fn dispatch_response(
     let choice = response.choices.into_iter().next()
         .context("LM Studio returned no choices")?;
 
-    match choice.finish_reason.as_str() {
-        "tool_calls" => {
-            // Take only the first call — we execute one tool per turn.
-            // Persisting a single call+result keeps the history valid per the spec.
-            // (The model sometimes emits multiple calls; extras are intentionally discarded.)
-            let call = choice.message.tool_calls.into_iter().next()
-                .context("finish_reason was tool_calls but tool_calls array is empty")?;
+    // LM Studio doesn't reliably set finish_reason="tool_calls" even with
+    // tool_choice:"required" — check the actual tool_calls array instead.
+    // Guard against "length" (truncated JSON) before attempting to parse.
+    if choice.finish_reason == "length" {
+        anyhow::bail!("LM Studio response was truncated (finish_reason=\"length\") — increase max_tokens");
+    }
+
+    if !choice.message.tool_calls.is_empty() {
+        // --- Tool call path ---
+        // Take only the first call — we execute one tool per turn.
+        // Persisting a single call+result keeps the history valid per the spec.
+        // (The model sometimes emits multiple calls; extras are intentionally discarded.)
+        let call = choice.message.tool_calls.into_iter().next()
+            .expect("checked non-empty above");
+
+        {
+            // Inline block to shadow `choice` fields we've consumed.
             // Serialise just this one call so the assistant history entry matches exactly
             // one tool-result entry — never leaving unresolved calls in the context.
             let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
@@ -270,31 +295,339 @@ async fn dispatch_response(
                     timestamp: now,
                 },
             ];
-            Ok((result, history))
-        }
-        _ => {
-            // "stop", "length", or any other — treat as direct reply.
-            let raw = choice.message.content.unwrap_or_default();
-            let reply = strip_think_blocks(&raw).trim().to_string();
-            let reply = if reply.is_empty() { "(no response)".into() } else { reply };
-            let history = vec![
-                ConversationMessage { role: "assistant".into(), content: Some(reply.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
-            ];
-            Ok((reply, history))
+            return Ok((result, history));
         }
     }
+
+    // --- Text reply path (no tool calls) ---
+    let raw = choice.message.content.unwrap_or_default();
+    let reply = strip_think_blocks(&raw).trim().to_string();
+    let reply = if reply.is_empty() { "(no response)".into() } else { reply };
+    let history = vec![
+        ConversationMessage { role: "assistant".into(), content: Some(reply.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
+    ];
+    Ok((reply, history))
 }
 
 // ---------------------------------------------------------------------------
 // Prompt builder
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(personality: &str, memory_bullets: &str) -> String {
+fn build_system_prompt(core: &CoreMemory, memory_bullets: &str, episodic_entries: &[crate::episodic::EpisodicEntry]) -> String {
+    let notable: Vec<String> = episodic_entries
+        .iter()
+        .filter(|e| e.importance >= 3)
+        .rev()
+        .take(3)
+        .map(|e| format!("- [{}] (★{}) {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.content))
+        .collect();
+
+    let episodic_section = if notable.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Episodic Notes\n{}", notable.join("\n"))
+    };
+
     format!(
-        "{personality}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\n## Recent memory\n{memory_bullets}",
-        personality = personality,
+        "{core_block}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\n## Recent Memory\n{memory_bullets}{episodic_section}",
+        core_block = core.to_prompt_block(),
         memory_bullets = memory_bullets,
+        episodic_section = episodic_section,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat / interest-check entrypoints
+// ---------------------------------------------------------------------------
+
+/// Fire-and-forget proactive heartbeat. Called by the scheduler on `heartbeat_cron`.
+/// Loads context, reviews interests and recent episodic notes, optionally sends a
+/// message to the user. Completely silent if nothing is worth sharing.
+pub async fn run_heartbeat(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+) {
+    if let Err(e) = try_run_heartbeat(config, bot, scheduler).await {
+        tracing::warn!("Heartbeat error: {e}");
+    }
+}
+
+async fn try_run_heartbeat(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+) -> anyhow::Result<()> {
+    let (core, episodic_entries) = tokio::join!(
+        crate::core_memory::load(),
+        crate::episodic::load_recent(10),
+    );
+    let core = core?;
+    let episodic_entries = episodic_entries?;
+
+    let system_prompt = build_heartbeat_system_prompt(&core, &episodic_entries);
+    let messages = vec![
+        LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
+        LmMessage { role: "user".into(), content: Some("Heartbeat check. Review your interests and recent observations. If there is something worth sharing, send a message. Otherwise, stay silent.".into()), tool_calls: None, tool_call_id: None },
+    ];
+
+    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 25).await
+}
+
+/// Focused check for a single registered interest. Called by per-interest cron jobs.
+pub async fn run_interest_check(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+    interest_id: String,
+) {
+    if let Err(e) = try_run_interest_check(config, bot, scheduler, interest_id).await {
+        tracing::warn!("Interest check error: {e}");
+    }
+}
+
+async fn try_run_interest_check(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+    interest_id: String,
+) -> anyhow::Result<()> {
+    let core = crate::core_memory::load().await?;
+    let Some(interest) = core.interests.iter().find(|i| i.id == interest_id).cloned() else {
+        tracing::info!("Interest {interest_id} not found (may have been retired) — skipping check");
+        return Ok(());
+    };
+
+    let system_prompt = format!(
+        "{core_block}\n\n## Current Interest Check\nYou are doing a focused check on one of your tracked interests:\n- Topic: {topic}\n- Description: {description}\n\nResearch whether there are any noteworthy recent developments. Only send a message to the user if you find something genuinely worth sharing. Silence is the default.",
+        core_block = core.to_prompt_block(),
+        topic = interest.topic,
+        description = interest.description,
+    );
+    let messages = vec![
+        LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
+        LmMessage { role: "user".into(), content: Some(format!("Check for updates on: {}", interest.topic)), tool_calls: None, tool_call_id: None },
+    ];
+
+    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 25).await
+}
+
+fn build_heartbeat_system_prompt(
+    core: &CoreMemory,
+    entries: &[crate::episodic::EpisodicEntry],
+) -> String {
+    let notable: Vec<String> = entries
+        .iter()
+        .filter(|e| e.importance >= 3)
+        .rev()
+        .take(5)
+        .map(|e| format!("- [{}] (★{}) {}", e.timestamp.format("%Y-%m-%d"), e.importance, e.content))
+        .collect();
+
+    let episodic_section = if notable.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Recent Observations\n{}", notable.join("\n"))
+    };
+
+    format!(
+        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}\n\nYou are in heartbeat mode. Review your interests and recent observations. Silence is the default — only send a message if you have something genuinely useful or timely to share with the user.",
+        core_block = core.to_prompt_block(),
+        interests = core.interests_block(),
+        episodic_section = episodic_section,
+    )
+}
+
+/// Shared agentic loop used by heartbeat and interest checks.
+/// Loops up to `max_iters`, dispatching tool calls and accumulating context.
+/// Breaks silently on `nothing`, sends a message and breaks on `reply_to_user`.
+async fn run_agentic_loop(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+    mut messages: Vec<LmMessage>,
+    tool_defs: serde_json::Value,
+    max_iters: usize,
+) -> anyhow::Result<()> {
+    // If a background model is configured, swap it in for CLI calls.
+    let call_config: Arc<Config> = if config.background_copilot_model.is_some() {
+        Arc::new(Config {
+            copilot_model: config.background_copilot_model.clone(),
+            ..(*config).clone()
+        })
+    } else {
+        config.clone()
+    };
+
+    for iter in 0..max_iters {
+        let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 4096).await?;
+        let choice = response.choices.into_iter().next()
+            .context("LM Studio returned no choices")?;
+
+        if choice.finish_reason == "length" {
+            anyhow::bail!("Agentic loop response truncated (finish_reason=length)");
+        }
+
+        if choice.message.tool_calls.is_empty() {
+            // Plain text reply — send if non-empty.
+            let raw = choice.message.content.unwrap_or_default();
+            let text = strip_think_blocks(&raw).trim().to_string();
+            if !text.is_empty() {
+                bot.send_message(ChatId(config.allowed_user_id as i64), text).await?;
+            }
+            break;
+        }
+
+        let call = choice.message.tool_calls.into_iter().next().expect("checked non-empty");
+        let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
+        let tool_name = call.function.name.clone();
+        let call_id = call.id.clone();
+
+        tracing::info!("Agentic loop iter {}: tool={}", iter + 1, tool_name);
+
+        let result = tools::dispatch_tool_call(call_config.clone(), bot.clone(), scheduler.clone(), call).await?;
+
+        if tool_name == "reply_to_user" {
+            bot.send_message(ChatId(config.allowed_user_id as i64), result).await?;
+            break;
+        }
+        if tool_name == "nothing" {
+            break;
+        }
+
+        // Push tool call + result into context and continue.
+        messages.push(LmMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: single_call_json,
+            tool_call_id: None,
+        });
+        messages.push(LmMessage {
+            role: "tool".into(),
+            content: Some(result),
+            tool_calls: None,
+            tool_call_id: Some(call_id),
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Memory evaluation pass (post-response, fire-and-forget)
+// ---------------------------------------------------------------------------
+
+/// After each turn, ask the model whether anything from the exchange warrants
+/// a core memory update. Runs in a spawned task — the user already has their
+/// reply before this fires.
+async fn run_memory_eval(
+    config: Arc<Config>,
+    user_msg: String,
+    assistant_reply: String,
+) -> anyhow::Result<()> {
+    let eval_tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "update_core_memory",
+                "description": "Update a section of persistent memory with a new value. Preserve all existing facts and append new ones — do not discard what is already known.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "section": {
+                            "type": "string",
+                            "enum": ["identity", "beliefs", "user_profile", "curiosity_queue"],
+                            "description": "Which section to update. user_profile for facts about the user; beliefs for your evolving worldview; identity for your self-description; curiosity_queue for topics to explore."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New value for the section. For user_profile and identity: plain prose. For beliefs and curiosity_queue: JSON array of strings e.g. [\"item1\",\"item2\"]."
+                        }
+                    },
+                    "required": ["section", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nothing",
+                "description": "Use only when the exchange contained no new facts about the user and no new opinions or beliefs worth recording.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }
+    ]);
+
+    // Load current memory so the model can see what's already known and avoid
+    // re-recording things that are already captured.
+    let current = crate::core_memory::load().await?;
+
+    let beliefs_display = if current.beliefs.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        current.beliefs.iter().map(|b| format!("- {b}")).collect::<Vec<_>>().join("\n")
+    };
+
+    let system_msg = format!(
+        "You are maintaining persistent memory for AnieBot, a personal AI assistant.\n\n\
+         ## Current memory\n\
+         **User profile:** {user_profile}\n\
+         **Beliefs:** {beliefs}\n\n\
+         ## Your task\n\
+         Review the exchange below. Did it reveal anything NEW not already captured above?\n\n\
+         Update if the exchange contained ANY of these:\n\
+         - User's name, location, job, field, or life stage\n\
+         - User's achievements, projects, relationships, or preferences\n\
+         - A clear opinion or belief you formed during this conversation\n\
+         - Anything that defines who the user is or what matters to them\n\n\
+         Call `nothing` only for pure small talk, acknowledgements, or follow-ups \
+         that add no new facts (e.g. \"thanks\", \"got it\", \"that makes sense\").\n\n\
+         When updating user_profile, write a concise prose summary that PRESERVES \
+         existing facts and adds the new ones — do not discard what is already known.",
+        user_profile = current.user_profile,
+        beliefs = beliefs_display,
+    );
+
+    let exchange = format!("User: {user_msg}\nAssistant: {assistant_reply}");
+
+    let messages = vec![
+        LmMessage { role: "system".into(), content: Some(system_msg), tool_calls: None, tool_call_id: None },
+        LmMessage { role: "user".into(), content: Some(exchange), tool_calls: None, tool_call_id: None },
+    ];
+
+    // Use 4096 tokens: reasoning models spend several hundred tokens on <think>
+    // blocks before emitting the actual tool call, and complex reflections need room.
+    let response = post_to_lm_studio(&config, &messages, Some(&eval_tools), 4096).await?;
+    let choice = response.choices.into_iter().next()
+        .context("Memory eval: LM Studio returned no choices")?;
+
+    // Don't gate on finish_reason — LM Studio sometimes returns "stop" even when
+    // tool_choice:"required" forced a tool call. Check tool_calls directly instead.
+    // Guard against "length" (truncated JSON) before attempting to parse.
+    tracing::info!("Memory eval finish_reason: {}", choice.finish_reason);
+    if choice.finish_reason == "length" {
+        tracing::warn!("Memory eval response truncated — skipping");
+        return Ok(());
+    }
+    let call = match choice.message.tool_calls.into_iter().next() {
+        Some(c) => c,
+        None => {
+            tracing::info!("Memory eval: no tool call in response — skipping");
+            return Ok(());
+        }
+    };
+
+    tracing::info!("Memory eval tool called: {}", call.function.name);
+    if call.function.name == "update_core_memory" {
+        let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+            .context("Memory eval: invalid tool arguments")?;
+        let section = args["section"].as_str().context("Memory eval: missing section")?;
+        let content = args["content"].as_str().context("Memory eval: missing content")?;
+        crate::core_memory::update_section(section, content).await?;
+        tracing::info!("Memory eval updated core memory section '{section}'");
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -307,16 +640,5 @@ fn strip_think_blocks(s: &str) -> &str {
         &s[end + "</think>".len()..]
     } else {
         s
-    }
-}
-
-async fn load_personality() -> anyhow::Result<String> {
-    match tokio::fs::read_to_string("personality.md").await {
-        Ok(content) => Ok(content),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::warn!("personality.md not found, proceeding without it");
-            Ok(String::new())
-        }
-        Err(e) => Err(e.into()),
     }
 }

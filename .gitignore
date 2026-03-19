@@ -11,3 +11,4 @@ target/
 # Editor
 .vscode/
 .idea/
+.github/prompts/

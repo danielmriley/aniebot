@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 mod bot;
 mod cli_wrapper;
 mod config;
+mod core_memory;
+mod episodic;
 mod memory;
 mod orchestrator;
 mod schedule_store;
@@ -20,7 +22,9 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = Arc::new(Config::from_env()?);
@@ -28,6 +32,16 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all("data/conversations").await?;
     tokio::fs::create_dir_all("data").await?;
     tokio::fs::create_dir_all(&config.workspace_dir).await?;
+
+    // Seed core memory from personality.md on first run.
+    if !tokio::fs::try_exists("data/core_memory.json").await.unwrap_or(false) {
+        let identity = tokio::fs::read_to_string("personality.md")
+            .await
+            .unwrap_or_else(|_| "I am AnieBot, a helpful and opinionated AI assistant.".to_string());
+        let cm = core_memory::CoreMemory { identity, ..Default::default() };
+        core_memory::save(&cm).await?;
+        tracing::info!("Core memory seeded from personality.md");
+    }
 
     tracing::info!("AnieBot starting...");
 

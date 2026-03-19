@@ -13,6 +13,8 @@ pub struct Config {
     pub morning_summary_cron: String,
     pub health_check_interval_mins: u64,
     pub copilot_model: Option<String>,
+    pub heartbeat_cron: String,
+    pub background_copilot_model: Option<String>,
 }
 
 impl Config {
@@ -44,6 +46,9 @@ impl Config {
             .unwrap_or_else(|_| "0 0 8 * * *".into());
 
         let copilot_model = std::env::var("COPILOT_MODEL").ok();
+        let heartbeat_cron = std::env::var("HEARTBEAT_CRON")
+            .unwrap_or_else(|_| "0 0 * * * *".into());
+        let background_copilot_model = std::env::var("BACKGROUND_COPILOT_MODEL").ok();
 
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
@@ -60,6 +65,8 @@ impl Config {
             morning_summary_cron,
             health_check_interval_mins,
             copilot_model,
+            heartbeat_cron,
+            background_copilot_model,
         })
     }
 }
