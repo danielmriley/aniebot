@@ -16,6 +16,12 @@ pub struct Config {
     pub heartbeat_cron: String,
     pub background_copilot_model: Option<String>,
     pub consolidation_threshold: usize,
+    pub max_iters_conversation: usize,
+    pub max_iters_heartbeat: usize,
+    pub max_iters_consolidation: usize,
+    pub max_iters_agenda: usize,
+    pub context_compress_threshold: usize,
+    pub background_lm_model: Option<String>,
 }
 
 impl Config {
@@ -55,6 +61,33 @@ impl Config {
             .parse::<usize>()
             .context("CONSOLIDATION_THRESHOLD must be a valid integer")?;
 
+        let max_iters_conversation = std::env::var("LOOP_ITERS_CONVERSATION")
+            .unwrap_or_else(|_| "20".into())
+            .parse::<usize>()
+            .context("LOOP_ITERS_CONVERSATION must be a valid integer")?;
+
+        let max_iters_heartbeat = std::env::var("LOOP_ITERS_HEARTBEAT")
+            .unwrap_or_else(|_| "12".into())
+            .parse::<usize>()
+            .context("LOOP_ITERS_HEARTBEAT must be a valid integer")?;
+
+        let max_iters_consolidation = std::env::var("LOOP_ITERS_CONSOLIDATION")
+            .unwrap_or_else(|_| "10".into())
+            .parse::<usize>()
+            .context("LOOP_ITERS_CONSOLIDATION must be a valid integer")?;
+
+        let max_iters_agenda = std::env::var("LOOP_ITERS_AGENDA")
+            .unwrap_or_else(|_| "20".into())
+            .parse::<usize>()
+            .context("LOOP_ITERS_AGENDA must be a valid integer")?;
+
+        let context_compress_threshold = std::env::var("LOOP_CONTEXT_THRESHOLD")
+            .unwrap_or_else(|_| "30".into())
+            .parse::<usize>()
+            .context("LOOP_CONTEXT_THRESHOLD must be a valid integer")?;
+
+        let background_lm_model = std::env::var("BACKGROUND_LM_MODEL").ok();
+
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
             .parse::<u64>()
@@ -73,6 +106,12 @@ impl Config {
             heartbeat_cron,
             background_copilot_model,
             consolidation_threshold,
+            max_iters_conversation,
+            max_iters_heartbeat,
+            max_iters_consolidation,
+            max_iters_agenda,
+            context_compress_threshold,
+            background_lm_model,
         })
     }
 }

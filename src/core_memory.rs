@@ -191,10 +191,16 @@ pub async fn add_interest(
 }
 
 /// Remove an interest by ID from core memory.
-pub async fn retire_interest(id: &str) -> Result<()> {
+/// Returns `true` if the interest was found and removed, `false` if no such ID exists.
+pub async fn retire_interest(id: &str) -> Result<bool> {
     let mut cm = load().await?;
+    let before = cm.interests.len();
     cm.interests.retain(|e| e.id != id);
-    save(&cm).await
+    if cm.interests.len() == before {
+        return Ok(false);
+    }
+    save(&cm).await?;
+    Ok(true)
 }
 
 /// Set the current active task description.

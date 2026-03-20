@@ -61,6 +61,26 @@ fn tool_delegate_cli() -> serde_json::Value {
     })
 }
 
+fn tool_fetch_url() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch the raw contents of a URL via HTTP GET. Use for reading web pages, REST APIs, or any public HTTP resource. Returns up to 8 KB of the response body as text. Prefer this over delegate_cli for simple, unauthenticated GET requests.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch (must be HTTP or HTTPS)."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    })
+}
+
 fn tool_schedule_task() -> serde_json::Value {
     json!({
         "type": "function",
@@ -189,13 +209,17 @@ fn tool_reply_to_user() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "reply_to_user",
-            "description": "Send a direct conversational reply to the user. Use this for: greetings; thank-yous and acknowledgements ('thanks', 'got it', 'that's a lot'); reactions to information you just provided; opinion and discussion questions ('what do you think', 'how do you feel'); casual conversation; anything that does not require fetching new external data. When in doubt, use this tool.",
+            "description": "Send a direct conversational reply to the user. IMPORTANT: Only call this AFTER you have completed the requested work. If the user asked you to do something (search, fetch data, run a task), do it first with delegate_cli or other tools, then call this with the results. Use this for: greetings; thank-yous; reactions to information you just provided; opinion and discussion questions; casual conversation; anything that does not require fetching new external data. Do NOT call this first and skip the work.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
                         "description": "The reply text to send to the user."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Set true to send this reply immediately and keep working on remaining tasks. Omit or set false (default) to send and stop."
                     }
                 },
                 "required": ["message"]
@@ -436,7 +460,7 @@ fn tool_reflect() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "reflect",
-            "description": "Pause and assess your current progress. Call this after any series of searches or tool calls to decide what to do next. Write what you found (or did not find) in observation, then set done=true if the task is complete or there is nothing more useful to do. This is the primary way to conclude an agentic loop.",
+            "description": "Record an intermediate observation about your current progress. Call this after a series of tool calls to organize your thinking. done=false continues the loop. done=true exits the loop silently — the user will NOT automatically see any reply. In conversations, always call reply_to_user with your findings before using done=true. In background tasks (heartbeat, consolidation), done=true is the correct exit when there is nothing to report.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -446,7 +470,7 @@ fn tool_reflect() -> serde_json::Value {
                     },
                     "done": {
                         "type": "boolean",
-                        "description": "true if the task is complete or there is nothing more useful to do."
+                        "description": "Set true to exit the loop. WARNING: In conversations this exits silently — you MUST call reply_to_user first if you have findings to share. In background tasks, true is correct when there is nothing to report."
                     }
                 },
                 "required": ["observation", "done"]
@@ -462,6 +486,7 @@ fn tool_reflect() -> serde_json::Value {
 pub fn tool_definitions() -> serde_json::Value {
     json!([
         tool_delegate_cli(),
+        tool_fetch_url(),
         tool_schedule_task(),
         tool_list_schedules(),
         tool_delete_schedule(),
@@ -478,6 +503,9 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_set_task(),
         tool_clear_task(),
         tool_reflect(),
+        tool_add_agenda_item(),
+        tool_list_agenda_items(),
+        tool_cancel_agenda_item(),
     ])
 }
 
@@ -485,6 +513,7 @@ pub fn tool_definitions() -> serde_json::Value {
 pub fn heartbeat_tool_definitions() -> serde_json::Value {
     json!([
         tool_delegate_cli(),
+        tool_fetch_url(),
         tool_reply_to_user(),
         tool_add_interest(),
         tool_retire_interest(),
@@ -494,6 +523,10 @@ pub fn heartbeat_tool_definitions() -> serde_json::Value {
         tool_set_task(),
         tool_clear_task(),
         tool_reflect(),
+        tool_add_agenda_item(),
+        tool_list_agenda_items(),
+        tool_cancel_agenda_item(),
+        tool_complete_agenda_item(),
         tool_nothing("Do nothing and stay silent. Use this as the default when there is nothing worth sharing with the user right now."),
     ])
 }
@@ -503,19 +536,120 @@ pub fn heartbeat_tool_definitions() -> serde_json::Value {
 pub fn consolidation_tool_definitions() -> serde_json::Value {
     json!([
         tool_update_core_memory(true),
+        tool_fetch_url(),
         tool_remember(),
         tool_add_interest(),
         tool_retire_interest(),
         tool_set_task(),
         tool_clear_task(),
         tool_reflect(),
+        tool_add_agenda_item(),
+        tool_list_agenda_items(),
+        tool_cancel_agenda_item(),
+        tool_complete_agenda_item(),
         tool_nothing("Nothing to update from this consolidation cycle."),
     ])
+}
+
+fn tool_add_agenda_item() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "add_agenda_item",
+            "description": "Queue a task to be done later. Use this when you have work you cannot finish now but need to remember — it will appear in future system prompts until completed. Great for tasks deferred due to budget, scope, or ordering.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "What needs to be done."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional background or context helpful for completing this task later."
+                    }
+                },
+                "required": ["description"]
+            }
+        }
+    })
+}
+
+fn tool_list_agenda_items() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_agenda_items",
+            "description": "List all pending and in-progress agenda tasks.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_cancel_agenda_item() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "cancel_agenda_item",
+            "description": "Cancel a pending agenda task by its ID when it is no longer relevant.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "The UUID of the agenda item to cancel."
+                    }
+                },
+                "required": ["item_id"]
+            }
+        }
+    })
+}
+
+fn tool_complete_agenda_item() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "complete_agenda_item",
+            "description": "Mark an agenda task as completed and record what was accomplished.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "string",
+                        "description": "The UUID of the agenda item to complete."
+                    },
+                    "result": {
+                        "type": "string",
+                        "description": "Summary of what was accomplished."
+                    }
+                },
+                "required": ["item_id", "result"]
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Tool dispatch
 // ---------------------------------------------------------------------------
+
+async fn fetch_url_impl(url: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+    let status = response.status();
+    let bytes = response.bytes().await.map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
+    let cap = bytes.len().min(8 * 1024);
+    let text = String::from_utf8_lossy(&bytes[..cap]).into_owned();
+    Ok(format!("HTTP {}\n\n{}", status, text))
+}
 
 pub async fn dispatch_tool_call(
     config: Arc<Config>,
@@ -539,6 +673,15 @@ pub async fn dispatch_tool_call(
             match cli_wrapper::run(&config, task).await {
                 Ok(output) => Ok(format!("✅ Done!\n\n{}", output)),
                 Err(e) => Ok(format!("❌ copilot failed: {}", e)),
+            }
+        }
+        "fetch_url" => {
+            let url = args["url"].as_str()
+                .context("fetch_url missing 'url' argument")?;
+            tracing::info!("fetch_url: {}", url);
+            match fetch_url_impl(url).await {
+                Ok(content) => Ok(content),
+                Err(e) => Ok(format!("❌ fetch failed: {}", e)),
             }
         }
         "schedule_task" => {
@@ -786,7 +929,12 @@ pub async fn dispatch_tool_call(
         "retire_interest" => {
             let id = args["interest_id"].as_str()
                 .context("retire_interest missing 'interest_id' argument")?;
-            core_memory::retire_interest(id).await?;
+            if !core_memory::retire_interest(id).await? {
+                return Ok(format!(
+                    "⚠️ No interest with ID '{id}' found. \
+                     Use list_interests to see what is currently registered."
+                ));
+            }
             // Best-effort removal — the job may not exist if the interest had no cron.
             let _ = crate::scheduler::remove_dynamic_job(&scheduler, id).await;
             Ok("\u{2713} Interest retired.".into())
@@ -817,6 +965,50 @@ pub async fn dispatch_tool_call(
         "clear_task" => {
             core_memory::clear_task().await?;
             Ok("\u{2705} Current task cleared.".to_string())
+        }
+        "add_agenda_item" => {
+            let description = args["description"].as_str()
+                .context("add_agenda_item missing 'description'")?;
+            let context = args["context"].as_str();
+            let item = crate::agenda::add(description, context).await?;
+            Ok(format!("\u{2705} Task queued (ID: `{}`):\n{}", item.id, item.description))
+        }
+        "list_agenda_items" => {
+            let items = crate::agenda::list_pending().await?;
+            if items.is_empty() {
+                return Ok("No pending agenda items.".into());
+            }
+            let list = items.iter().map(|i| {
+                let status_str = match i.status {
+                    crate::agenda::AgendaStatus::InProgress => "In Progress",
+                    _ => "Pending",
+                };
+                let ctx = i.context.as_deref()
+                    .map(|c| format!("\n  Context: {c}"))
+                    .unwrap_or_default();
+                format!("\u{2022} {}\n  ID: `{}`  |  Status: {}{}", i.description, i.id, status_str, ctx)
+            }).collect::<Vec<_>>().join("\n\n");
+            Ok(format!("Pending tasks:\n\n{}", list))
+        }
+        "cancel_agenda_item" => {
+            let id = args["item_id"].as_str()
+                .context("cancel_agenda_item missing 'item_id'")?;
+            if crate::agenda::cancel(id).await? {
+                Ok(format!("\u{2705} Task `{}` cancelled.", id))
+            } else {
+                Ok(format!("\u{274c} No agenda item found with ID `{}`.", id))
+            }
+        }
+        "complete_agenda_item" => {
+            let id = args["item_id"].as_str()
+                .context("complete_agenda_item missing 'item_id'")?;
+            let result = args["result"].as_str()
+                .context("complete_agenda_item missing 'result'")?;
+            if crate::agenda::complete(id, result).await? {
+                Ok(format!("\u{2705} Task `{}` marked complete.", id))
+            } else {
+                Ok(format!("\u{274c} No agenda item found with ID `{}`.", id))
+            }
         }
         other => anyhow::bail!("Unknown tool name: {}", other),
     }

@@ -123,11 +123,12 @@ async fn try_process(
     }
 
     // Load full context.
-    let (core, history, recent_memory, recent_episodic) = tokio::try_join!(
+    let (core, history, recent_memory, recent_episodic, pending_agenda) = tokio::try_join!(
         crate::core_memory::load(),
         memory::load_history(chat_id),
         memory::load_recent_memory(MEMORY_ENTRIES),
         crate::episodic::load_recent(10),
+        crate::agenda::list_pending(),
     )?;
 
     // Build windowed history slice.
@@ -147,7 +148,7 @@ async fn try_process(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let system_prompt = build_system_prompt(&core, &memory_bullets, &recent_episodic);
+    let system_prompt = build_system_prompt(&core, &memory_bullets, &recent_episodic, &pending_agenda);
 
     // Build messages array.
     let mut messages: Vec<LmMessage> = Vec::with_capacity(1 + history_window.len() + 1);
@@ -162,10 +163,77 @@ async fn try_process(
     }
     messages.push(LmMessage { role: "user".into(), content: Some(user_input.to_string()), tool_calls: None, tool_call_id: None });
 
-    // Call LM Studio with tool definitions.
-    let tool_defs = tools::tool_definitions();
-    let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 1024).await?;
-    let (reply, assistant_turns) = dispatch_response(config.clone(), bot.clone(), scheduler.clone(), response).await?;
+    // Run the agentic conversation loop.
+    // send_reply=false: bot.rs handles sending the returned text via Telegram
+    // (it applies chunking for long messages, which we don't need to replicate here).
+    let max_iters = config.max_iters_conversation;
+    let (reply_opt, assistant_turns) = run_agentic_loop(
+        config.clone(),
+        bot.clone(),
+        scheduler.clone(),
+        messages,
+        tools::tool_definitions(),
+        max_iters,
+        false,
+    ).await?;
+    let reply = match reply_opt {
+        Some(r) => r,
+        None => {
+            // The agentic loop concluded without calling reply_to_user (e.g. via reflect(done=true)).
+            // Attempt a forced extraction pass using any tool results accumulated in the loop.
+            tracing::warn!("Agentic loop returned no reply — attempting forced extraction pass");
+            let tool_results_text: String = assistant_turns
+                .iter()
+                .filter(|m| m.role == "tool")
+                .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+            if !tool_results_text.is_empty() {
+                let extract_messages = vec![
+                    LmMessage {
+                        role: "system".into(),
+                        content: Some("You completed some research. Based on the tool results below, compose a clear, helpful reply for the user. Reply in plain prose — do not call any tools.".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    LmMessage {
+                        role: "user".into(),
+                        content: Some(user_input.to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    LmMessage {
+                        role: "user".into(),
+                        content: Some(format!("Research results from your tools:\n\n{}", tool_results_text)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ];
+                match post_to_lm_studio(&config, &extract_messages, None, 2048).await {
+                    Ok(resp) => {
+                        let raw = resp.choices.into_iter().next()
+                            .and_then(|c| c.message.content)
+                            .unwrap_or_default();
+                        let text = strip_think_blocks(&raw).trim().to_string();
+                        if !text.is_empty() {
+                            tracing::info!("Forced extraction pass succeeded");
+                            text
+                        } else {
+                            tracing::warn!("Forced extraction pass returned empty text");
+                            "I found some results but had trouble summarizing them. Please ask again.".into()
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Forced extraction pass failed: {e}");
+                        "I found some results but had trouble summarizing them. Please ask again.".into()
+                    }
+                }
+            } else {
+                tracing::warn!("Agentic loop returned no reply and no tool results");
+                "I wasn't able to complete that request. Please try again.".into()
+            }
+        }
+    };
 
     // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
     {
@@ -256,88 +324,16 @@ async fn post_to_lm_studio(
         .context("Failed to deserialize LM Studio response")
 }
 
-async fn dispatch_response(
-    config: Arc<Config>,
-    bot: Bot,
-    scheduler: Arc<SchedulerHandle>,
-    response: LmCompletionResponse,
-) -> anyhow::Result<(String, Vec<ConversationMessage>)> {
-    let now = Utc::now();
-    let choice = response.choices.into_iter().next()
-        .context("LM Studio returned no choices")?;
-
-    // LM Studio doesn't reliably set finish_reason="tool_calls" even with
-    // tool_choice:"required" — check the actual tool_calls array instead.
-    // Guard against "length" (truncated JSON) before attempting to parse.
-    if choice.finish_reason == "length" {
-        anyhow::bail!("LM Studio response was truncated (finish_reason=\"length\") — increase max_tokens");
-    }
-
-    if !choice.message.tool_calls.is_empty() {
-        // --- Tool call path ---
-        // Take only the first call — we execute one tool per turn.
-        // Persisting a single call+result keeps the history valid per the spec.
-        // (The model sometimes emits multiple calls; extras are intentionally discarded.)
-        let call = choice.message.tool_calls.into_iter().next()
-            .expect("checked non-empty above");
-
-        {
-            // Inline block to shadow `choice` fields we've consumed.
-            // Serialise just this one call so the assistant history entry matches exactly
-            // one tool-result entry — never leaving unresolved calls in the context.
-            let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
-            tracing::info!("Tool call: {}", call.function.name);
-
-            let tool_name = call.function.name.clone();
-            let call_id = call.id.clone();
-            let result = tools::dispatch_tool_call(config, bot, scheduler, call).await?;
-
-            // reply_to_user is the assistant speaking — store as a plain assistant message
-            // so the model sees it as its own statement, not external tool data.
-            if tool_name == "reply_to_user" {
-                let history = vec![
-                    ConversationMessage { role: "assistant".into(), content: Some(result.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
-                ];
-                return Ok((result, history));
-            }
-
-            // All other tools: proper [assistant(tool_calls), tool(result)] format.
-            // The model is fine-tuned to treat role="tool" as external fetched data.
-            let history = vec![
-                ConversationMessage {
-                    role: "assistant".into(),
-                    content: None,
-                    tool_calls: single_call_json,
-                    tool_call_id: None,
-                    timestamp: now,
-                },
-                ConversationMessage {
-                    role: "tool".into(),
-                    content: Some(result.clone()),
-                    tool_calls: None,
-                    tool_call_id: Some(call_id),
-                    timestamp: now,
-                },
-            ];
-            return Ok((result, history));
-        }
-    }
-
-    // --- Text reply path (no tool calls) ---
-    let raw = choice.message.content.unwrap_or_default();
-    let reply = strip_think_blocks(&raw).trim().to_string();
-    let reply = if reply.is_empty() { "(no response)".into() } else { reply };
-    let history = vec![
-        ConversationMessage { role: "assistant".into(), content: Some(reply.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
-    ];
-    Ok((reply, history))
-}
-
 // ---------------------------------------------------------------------------
 // Prompt builder
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(core: &CoreMemory, memory_bullets: &str, episodic_entries: &[crate::episodic::EpisodicEntry]) -> String {
+fn build_system_prompt(
+    core: &CoreMemory,
+    memory_bullets: &str,
+    episodic_entries: &[crate::episodic::EpisodicEntry],
+    pending_agenda: &[crate::agenda::AgendaItem],
+) -> String {
     let notable: Vec<String> = episodic_entries
         .iter()
         .filter(|e| e.importance >= 3)
@@ -352,14 +348,31 @@ fn build_system_prompt(core: &CoreMemory, memory_bullets: &str, episodic_entries
         format!("\n\n## Episodic Notes\n{}", notable.join("\n"))
     };
 
+    let agenda_section = if pending_agenda.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = pending_agenda
+            .iter()
+            .map(|i| {
+                let status_str = match i.status {
+                    crate::agenda::AgendaStatus::InProgress => "In Progress",
+                    _ => "Pending",
+                };
+                format!("- [{}] {} ({})", i.id, i.description, status_str)
+            })
+            .collect();
+        format!("\n\n## Pending Tasks\n{}", lines.join("\n"))
+    };
+
     let now_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
     format!(
-        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\n## Recent Memory\n{memory_bullets}{episodic_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nIf the user asks you to do something (find information, run a task, check on something), complete the work using tools first, then reply with results. Do not call reply_to_user before doing the work. When you have results to share, you MUST call reply_to_user — using reflect(done=true) without first calling reply_to_user will end the conversation silently and the user will see nothing.\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
         core_block = core.to_prompt_block(),
         now_utc = now_utc,
         memory_bullets = memory_bullets,
         episodic_section = episodic_section,
+        agenda_section = agenda_section,
     )
 }
 
@@ -385,12 +398,30 @@ async fn try_run_heartbeat(
     bot: Bot,
     scheduler: Arc<SchedulerHandle>,
 ) -> anyhow::Result<()> {
-    let (core, all_recent) = tokio::join!(
+    let (core, all_recent, pending_agenda) = tokio::join!(
         crate::core_memory::load(),
         crate::episodic::load_recent(50),
+        crate::agenda::list_pending(),
     );
     let core = core?;
     let all_recent = all_recent?;
+    let pending_agenda = pending_agenda.unwrap_or_default();
+
+    // Early-exit: if there is genuinely nothing to do, skip the agentic loop entirely.
+    // Interests empty + curiosity queue empty + no pending agenda = nothing actionable.
+    if core.interests.is_empty() && core.curiosity_queue.is_empty() && pending_agenda.is_empty() {
+        tracing::info!("Heartbeat: nothing to do (no interests, curiosity queue, or agenda) — skipping");
+        let entry = crate::episodic::EpisodicEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            content: "[heartbeat checked] No active interests.".to_string(),
+            tags: vec!["heartbeat-checked".to_string()],
+            importance: 1,
+            timestamp: chrono::Utc::now(),
+            promoted: false,
+        };
+        let _ = crate::episodic::append(&entry).await;
+        return Ok(());
+    }
 
     // Split recent episodic entries into general observations and prior heartbeat sends/checks.
     // Only treat entries within the last 6 hours as "recent" — older entries shouldn't suppress
@@ -411,13 +442,14 @@ async fn try_run_heartbeat(
         .cloned()
         .collect();
 
-    let system_prompt = build_heartbeat_system_prompt(&core, &all_recent, &recent_sends, &recent_checks);
+    let system_prompt = build_heartbeat_system_prompt(&core, &all_recent, &recent_sends, &recent_checks, &pending_agenda);
     let messages = vec![
         LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
         LmMessage { role: "user".into(), content: Some("Heartbeat check. Review your interests and recent observations. If there is something worth sharing, send a message. Otherwise, stay silent.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    let sent = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 12).await?;
+    let max_iters = config.max_iters_heartbeat;
+    let (sent, _) = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
 
     // Always write a heartbeat-checked entry with topics covered, so the next heartbeat cycle
     // can skip re-researching interests that were already checked and found nothing new.
@@ -498,7 +530,8 @@ async fn try_run_interest_check(
         LmMessage { role: "user".into(), content: Some(format!("Check for updates on: {}", interest.topic)), tool_calls: None, tool_call_id: None },
     ];
 
-    run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), 12).await?;
+    let max_iters = config.max_iters_agenda;
+    let _ = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
     Ok(())
 }
 
@@ -586,7 +619,7 @@ You are in consolidation mode. Make a single, complete pass through these observ
         LmMessage { role: "user".into(), content: Some("Consolidation cycle. Reflect and update as needed.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), 10).await?; // return value ignored for consolidation
+    let _ = run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), config.max_iters_consolidation, true).await?; // return value ignored for consolidation
 
     // Reload core memory after LM pass (model may have added/retired interests).
     // Apply health decay: -10 per consolidation pass for each interest whose topic
@@ -628,6 +661,7 @@ fn build_heartbeat_system_prompt(
     all_entries: &[crate::episodic::EpisodicEntry],
     recent_sends: &[crate::episodic::EpisodicEntry],
     recent_checks: &[crate::episodic::EpisodicEntry],
+    pending_agenda: &[crate::agenda::AgendaItem],
 ) -> String {
     let notable: Vec<String> = all_entries
         .iter()
@@ -663,9 +697,26 @@ fn build_heartbeat_system_prompt(
         format!("\n\n## Recently Checked (nothing new found)\n{}", lines.join("\n"))
     };
 
+    let agenda_section = if pending_agenda.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = pending_agenda
+            .iter()
+            .map(|i| {
+                let status_str = match i.status {
+                    crate::agenda::AgendaStatus::InProgress => "In Progress",
+                    _ => "Pending",
+                };
+                format!("- [{}] {} ({})", i.id, i.description, status_str)
+            })
+            .collect();
+        format!("\n\n## Pending Tasks\n{}", lines.join("\n"))
+    };
+
     format!(
-        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}{sends_section}{checks_section}\n\n\
+        "{core_block}\n\n## Active Interests\n{interests}{episodic_section}{sends_section}{checks_section}{agenda_section}\n\n\
 You are in heartbeat mode. Follow these steps in order:\n\
+0. Check '## Pending Tasks' above. Work through any Pending items — use tools as needed, then call complete_agenda_item when done. Cancel with cancel_agenda_item if no longer relevant. Skip items already In Progress or Done.\n\
 1. Review '## Recently Sent to You' and '## Recently Checked' above. Any interest whose topic appears in either list was already covered within the last 6 hours — SKIP delegate_cli for it entirely. Do not re-research it.\n\
 2. For interests NOT recently covered or checked, use delegate_cli to check for new or noteworthy developments.\n\
 3. If your curiosity queue has items, pick ONE and investigate it with delegate_cli. If fully resolved, remove it with update_core_memory(\"curiosity_queue\", ...).\n\
@@ -675,12 +726,37 @@ You are in heartbeat mode. Follow these steps in order:\n\
         episodic_section = episodic_section,
         sends_section = sends_section,
         checks_section = checks_section,
+        agenda_section = agenda_section,
     )
 }
 
-/// Shared agentic loop used by heartbeat and interest checks.
+// ---------------------------------------------------------------------------
+// Parallel-safe tools — read-only / idempotent; safe to dispatch concurrently.
+// Write tools (remember, forget, update_core_memory, add_interest, retire_interest,
+// schedule_*, set_task, clear_task, add_agenda_item, cancel_agenda_item,
+// complete_agenda_item) are always dispatched sequentially to avoid
+// read-modify-write races on JSON files.
+// ---------------------------------------------------------------------------
+
+const PARALLEL_SAFE_TOOLS: &[&str] = &[
+    "fetch_url",
+    "recall",
+    "list_interests",
+    "list_agenda_items",
+    "list_schedules",
+];
+
+/// Shared agentic loop used by heartbeat, interest checks, and conversation.
 /// Loops up to `max_iters`, dispatching tool calls and accumulating context.
-/// Returns the text that was sent to the user, if any.
+///
+/// `send_reply`: when `true` the loop sends Telegram messages directly (heartbeat /
+/// consolidation / interest-check contexts). When `false` the caller is responsible
+/// for sending the returned text (conversation context — bot.rs handles Telegram
+/// chunking logic there).
+///
+/// Returns `(reply_text, new_messages)` where `new_messages` is every LM/tool
+/// message added during the run.  Conversation callers persist these; background
+/// callers can discard with `let (sent, _) = …`.
 async fn run_agentic_loop(
     config: Arc<Config>,
     bot: Bot,
@@ -688,7 +764,8 @@ async fn run_agentic_loop(
     mut messages: Vec<LmMessage>,
     tool_defs: serde_json::Value,
     max_iters: usize,
-) -> anyhow::Result<Option<String>> {
+    send_reply: bool,
+) -> anyhow::Result<(Option<String>, Vec<ConversationMessage>)> {
     // If a background model is configured, swap it in for CLI calls.
     let call_config: Arc<Config> = if config.background_copilot_model.is_some() {
         Arc::new(Config {
@@ -700,8 +777,126 @@ async fn run_agentic_loop(
     };
 
     let mut seen_reflections: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Accumulates every new message produced during the loop for the caller to persist.
+    let mut new_messages: Vec<ConversationMessage> = Vec::new();
+
+    // 1.5B — Anti-stall: track previous call to detect identical duplicates.
+    let mut last_call_fingerprint: Option<(String, String)> = None;
+    let mut anti_stall_injected = false;
+
+    // 1.5C — Budget exhaustion: warn the model at 80% consumption.
+    let mut budget_warning_injected = false;
+
+    // 2.5 — Context compression: fire at most once per loop run.
+    let mut context_compressed = false;
 
     for iter in 0..max_iters {
+
+        // 2.5 — Compress the middle of the context window once, when it grows large.
+        if !context_compressed && messages.len() > config.context_compress_threshold {
+            // Need at least: 1 system + 2 middle + 4 tail = 7 messages to be worth splitting.
+            if messages.len() > 7 {
+                let tail = messages.split_off(messages.len() - 4);
+                let mid = messages.split_off(1); // messages = [system_prompt]
+
+                let summary_lines: String = mid
+                    .iter()
+                    .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()).map(|c| {
+                        let snippet = if c.len() > 400 { &c[..400] } else { c };
+                        format!("[{}] {}", m.role, snippet)
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                let summary_prompt = vec![
+                    LmMessage {
+                        role: "system".into(),
+                        content: Some("You are a transcript summarizer. Be concise.".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    LmMessage {
+                        role: "user".into(),
+                        content: Some(format!(
+                            "Summarize the following exchange in 3 concise bullet points. \
+                             Capture: what was attempted, what was found, and what decisions were made.\n\n{}",
+                            summary_lines
+                        )),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ];
+
+                // Use background_lm_model when configured; fall back to the main model.
+                let summary_model = config.background_lm_model
+                    .as_deref()
+                    .unwrap_or(&config.model_name)
+                    .to_string();
+                let summary_config = Arc::new(Config {
+                    model_name: summary_model,
+                    ..(*config).clone()
+                });
+
+                let n_compressed = mid.len();
+                match post_to_lm_studio(&summary_config, &summary_prompt, None, 512).await {
+                    Ok(resp) => {
+                        let raw = resp.choices.into_iter().next()
+                            .and_then(|c| c.message.content)
+                            .unwrap_or_default();
+                        let bullets = strip_think_blocks(&raw).trim().to_string();
+                        if !bullets.is_empty() {
+                            messages.push(LmMessage {
+                                role: "user".into(),
+                                content: Some(format!(
+                                    "[Context Summary — {} messages compressed]\n{}",
+                                    n_compressed, bullets
+                                )),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            context_compressed = true;
+                            tracing::info!(
+                                "Agentic loop iter {}: context compressed ({} messages → 1 summary)",
+                                iter + 1, n_compressed
+                            );
+                        } else {
+                            tracing::warn!("Context compression produced empty summary — restoring middle");
+                            messages.extend(mid);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Context compression LM call failed: {} — restoring middle", e);
+                        messages.extend(mid);
+                    }
+                }
+                // Always restore the tail.
+                messages.extend(tail);
+            }
+        }
+
+        // 1.5C — Inject a budget warning once when 80% of iterations are consumed.
+        if !budget_warning_injected && max_iters > 4 && iter == (max_iters * 4) / 5 {
+            let remaining = max_iters - iter;
+            messages.push(LmMessage {
+                role: "user".into(),
+                content: Some(format!(
+                    "[System: {} iteration{} remaining in this run. \
+                     Wrap up your current work. Queue any unfinished tasks with \
+                     add_agenda_item if available, then conclude with \
+                     reflect(done=true) or reply_to_user.]",
+                    remaining,
+                    if remaining == 1 { "" } else { "s" },
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            budget_warning_injected = true;
+            tracing::info!(
+                "Agentic loop iter {}: budget warning injected ({} iters remain)",
+                iter + 1, remaining
+            );
+        }
+
         tracing::info!("Agentic loop iter {}: awaiting LM...", iter + 1);
         let lm_start = std::time::Instant::now();
         let response = post_to_lm_studio(&config, &messages, Some(&tool_defs), 4096).await?;
@@ -718,66 +913,403 @@ async fn run_agentic_loop(
             let raw = choice.message.content.unwrap_or_default();
             let text = strip_think_blocks(&raw).trim().to_string();
             if !text.is_empty() {
-                bot.send_message(ChatId(config.allowed_user_id as i64), text.clone()).await?;
-                return Ok(Some(text));
+                if send_reply {
+                    bot.send_message(ChatId(config.allowed_user_id as i64), text.clone()).await?;
+                }
+                new_messages.push(ConversationMessage {
+                    role: "assistant".into(),
+                    content: Some(text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Utc::now(),
+                });
+                return Ok((Some(text), new_messages));
             }
-            return Ok(None);
+            return Ok((None, new_messages));
         }
 
-        let call = choice.message.tool_calls.into_iter().next().expect("checked non-empty");
-        let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
-        let tool_name = call.function.name.clone();
-        let call_id = call.id.clone();
-        let raw_args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
+        let all_tool_calls = choice.message.tool_calls;
 
-        // Exact-duplicate backstop: if the model makes the identical reflect call twice, exit.
-        if tool_name == "reflect" {
-            if !seen_reflections.insert(call.function.arguments.clone()) {
-                tracing::warn!("Agentic loop early exit: duplicate reflect call at iter {}", iter + 1);
-                return Ok(None);
+        if all_tool_calls.len() == 1 {
+            // ----------------------------------------------------------------
+            // Single-call path — unchanged.  Anti-stall and reflect dedup live
+            // here exclusively; they don't apply to multi-call responses.
+            // ----------------------------------------------------------------
+            let call = all_tool_calls.into_iter().next().expect("checked non-empty");
+            let single_call_json = serde_json::to_value(std::slice::from_ref(&call)).ok();
+            let tool_name = call.function.name.clone();
+            let call_id = call.id.clone();
+            let raw_args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
+
+            // 1.5B — Anti-stall: if the model repeats the exact same call, dispatch it
+            // (to keep the transcript valid), then inject a warning before the next LM call.
+            let current_fingerprint = (tool_name.clone(), call.function.arguments.clone());
+            if !anti_stall_injected {
+                if let Some(ref last) = last_call_fingerprint {
+                    if *last == current_fingerprint {
+                        tracing::warn!(
+                            "Agentic loop iter {}: anti-stall triggered (repeated {})",
+                            iter + 1, tool_name
+                        );
+                        let dispatch_start = std::time::Instant::now();
+                        let result = tools::dispatch_tool_call(
+                            call_config.clone(), bot.clone(), scheduler.clone(), call,
+                        ).await?;
+                        let dispatch_elapsed = dispatch_start.elapsed();
+                        tracing::info!(
+                            "Agentic loop iter {}: tool={} done [tool: {:.1}s]",
+                            iter + 1, tool_name, dispatch_elapsed.as_secs_f32()
+                        );
+                        let now = Utc::now();
+                        messages.push(LmMessage {
+                            role: "assistant".into(), content: None,
+                            tool_calls: single_call_json.clone(), tool_call_id: None,
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "assistant".into(), content: None,
+                            tool_calls: single_call_json, tool_call_id: None, timestamp: now,
+                        });
+                        messages.push(LmMessage {
+                            role: "tool".into(), content: Some(result.clone()),
+                            tool_calls: None, tool_call_id: Some(call_id.clone()),
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "tool".into(), content: Some(result),
+                            tool_calls: None, tool_call_id: Some(call_id), timestamp: now,
+                        });
+                        messages.push(LmMessage {
+                            role: "user".into(),
+                            content: Some(format!(
+                                "[System: You just called `{}` with the same arguments twice in a row. \
+                                 This looks like a loop. Try a different tool or approach, \
+                                 or call reflect(done=true) to conclude.]",
+                                tool_name
+                            )),
+                            tool_calls: None, tool_call_id: None,
+                        });
+                        anti_stall_injected = true;
+                        last_call_fingerprint = Some(current_fingerprint);
+                        continue;
+                    }
+                }
             }
-        }
+            last_call_fingerprint = Some(current_fingerprint);
 
-        tracing::info!("Agentic loop iter {}: tool={} [LM: {:.1}s]", iter + 1, tool_name, lm_elapsed.as_secs_f32());
-
-        let dispatch_start = std::time::Instant::now();
-        let result = tools::dispatch_tool_call(call_config.clone(), bot.clone(), scheduler.clone(), call).await?;
-        let dispatch_elapsed = dispatch_start.elapsed();
-        tracing::info!("Agentic loop iter {}: tool={} done [tool: {:.1}s]", iter + 1, tool_name, dispatch_elapsed.as_secs_f32());
-
-        if tool_name == "reply_to_user" {
-            bot.send_message(ChatId(config.allowed_user_id as i64), result.clone()).await?;
-            return Ok(Some(result));
-        }
-        if tool_name == "nothing" {
-            return Ok(None);
-        }
-        if tool_name == "reflect" {
-            if raw_args["done"].as_bool().unwrap_or(false) {
-                tracing::info!("Agentic loop: reflect concluded at iter {}", iter + 1);
-                return Ok(None);
+            // Exact-duplicate backstop: if the model makes the identical reflect call twice, exit.
+            if tool_name == "reflect" {
+                if !seen_reflections.insert(call.function.arguments.clone()) {
+                    tracing::warn!("Agentic loop early exit: duplicate reflect call at iter {}", iter + 1);
+                    return Ok((None, new_messages));
+                }
             }
-            // done=false: observation goes into context below, loop continues
+
+            tracing::info!("Agentic loop iter {}: tool={} [LM: {:.1}s]", iter + 1, tool_name, lm_elapsed.as_secs_f32());
+
+            let dispatch_start = std::time::Instant::now();
+            let result = tools::dispatch_tool_call(call_config.clone(), bot.clone(), scheduler.clone(), call).await?;
+            let dispatch_elapsed = dispatch_start.elapsed();
+            tracing::info!("Agentic loop iter {}: tool={} done [tool: {:.1}s]", iter + 1, tool_name, dispatch_elapsed.as_secs_f32());
+
+            if tool_name == "reply_to_user" {
+                let background = raw_args["background"].as_bool().unwrap_or(false);
+                if send_reply || background {
+                    bot.send_message(ChatId(config.allowed_user_id as i64), result.clone()).await?;
+                }
+                // Always persist the reply as an assistant message.
+                new_messages.push(ConversationMessage {
+                    role: "assistant".into(),
+                    content: Some(result.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Utc::now(),
+                });
+                if !background {
+                    return Ok((Some(result), new_messages));
+                }
+                // background=true: push the tool-call pair into LM context so the
+                // transcript stays well-formed, then inject a continuation hint.
+                messages.push(LmMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: single_call_json,
+                    tool_call_id: None,
+                });
+                messages.push(LmMessage {
+                    role: "tool".into(),
+                    content: Some(result),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                });
+                messages.push(LmMessage {
+                    role: "user".into(),
+                    content: Some("[System: Reply sent. Continue working.]".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                tracing::info!(
+                    "Agentic loop iter {}: reply_to_user(background=true) — reply sent, continuing",
+                    iter + 1
+                );
+                continue;
+            }
+            if tool_name == "nothing" {
+                return Ok((None, new_messages));
+            }
+            if tool_name == "reflect" {
+                if raw_args["done"].as_bool().unwrap_or(false) {
+                    tracing::info!("Agentic loop: reflect concluded at iter {}", iter + 1);
+                    return Ok((None, new_messages));
+                }
+                // done=false: observation goes into context below, loop continues
+            }
+
+            tracing::debug!("Agentic loop iter {} result: {:.500}", iter + 1, result);
+
+            // Push tool call + result into context and continue.
+            let now = Utc::now();
+            messages.push(LmMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: single_call_json.clone(),
+                tool_call_id: None,
+            });
+            new_messages.push(ConversationMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: single_call_json,
+                tool_call_id: None,
+                timestamp: now,
+            });
+            messages.push(LmMessage {
+                role: "tool".into(),
+                content: Some(result.clone()),
+                tool_calls: None,
+                tool_call_id: Some(call_id.clone()),
+            });
+            new_messages.push(ConversationMessage {
+                role: "tool".into(),
+                content: Some(result),
+                tool_calls: None,
+                tool_call_id: Some(call_id),
+                timestamp: now,
+            });
+
+        } else {
+            // ----------------------------------------------------------------
+            // Phase 3 — Multi-call path.
+            //
+            // All PARALLEL_SAFE_TOOLS are dispatched concurrently via JoinSet.
+            // Any batch that contains a write tool, a terminal tool, or a mix
+            // of safe and unsafe tools is dispatched sequentially instead.
+            // Terminal tools (reply_to_user, nothing, reflect/done) are always
+            // executed last — other tools are drained first.
+            // ----------------------------------------------------------------
+            let all_calls_json = serde_json::to_value(&all_tool_calls).ok();
+
+            let all_parallel_safe = all_tool_calls
+                .iter()
+                .all(|c| PARALLEL_SAFE_TOOLS.contains(&c.function.name.as_str()));
+
+            // Separate terminal calls from non-terminal to ensure non-terminal
+            // tools run first (they may produce data that informs the reply).
+            let (terminal_calls, other_calls): (Vec<_>, Vec<_>) = all_tool_calls
+                .into_iter()
+                .partition(|c| matches!(c.function.name.as_str(), "reply_to_user" | "nothing" | "reflect"));
+
+            // Dispatch type alias: (original_index, call_id, tool_name, raw_args, result)
+            type DispatchItem = (usize, String, String, serde_json::Value, anyhow::Result<String>);
+
+            // --- Dispatch non-terminal tools ---
+            let mut results: Vec<DispatchItem> = if all_parallel_safe && terminal_calls.is_empty() {
+                // All calls are safe to run in parallel.
+                let mut join_set: tokio::task::JoinSet<DispatchItem> = tokio::task::JoinSet::new();
+                for (idx, call) in other_calls.into_iter().enumerate() {
+                    let raw_args: serde_json::Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                    let call_id = call.id.clone();
+                    let tool_name = call.function.name.clone();
+                    let (cc, b, s) = (call_config.clone(), bot.clone(), scheduler.clone());
+                    join_set.spawn(async move {
+                        let r = tools::dispatch_tool_call(cc, b, s, call).await;
+                        (idx, call_id, tool_name, raw_args, r)
+                    });
+                }
+                let mut raw: Vec<DispatchItem> = Vec::with_capacity(join_set.len());
+                while let Some(joined) = join_set.join_next().await {
+                    raw.push(joined.context("parallel tool task panicked")?);
+                }
+                raw.sort_by_key(|(idx, ..)| *idx);
+                raw
+            } else {
+                // Sequential dispatch for safety (write tools, mixed batches).
+                let mut raw: Vec<DispatchItem> = Vec::new();
+                for (idx, call) in other_calls.into_iter().enumerate() {
+                    let raw_args: serde_json::Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                    let call_id = call.id.clone();
+                    let tool_name = call.function.name.clone();
+                    let r = tools::dispatch_tool_call(
+                        call_config.clone(), bot.clone(), scheduler.clone(), call,
+                    ).await;
+                    raw.push((idx, call_id, tool_name, raw_args, r));
+                }
+                raw
+            };
+
+            // --- Append terminal tools (sequential, after all others) ---
+            let base_idx = results.len();
+            for (i, call) in terminal_calls.into_iter().enumerate() {
+                let raw_args: serde_json::Value =
+                    serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                let call_id = call.id.clone();
+                let tool_name = call.function.name.clone();
+                let r = tools::dispatch_tool_call(
+                    call_config.clone(), bot.clone(), scheduler.clone(), call,
+                ).await;
+                results.push((base_idx + i, call_id, tool_name, raw_args, r));
+            }
+
+            tracing::info!(
+                "Agentic loop iter {}: multi-call ({} tools) [LM: {:.1}s]",
+                iter + 1, results.len(), lm_elapsed.as_secs_f32()
+            );
+
+            // Push one assistant message containing the full tool_calls array.
+            let now = Utc::now();
+            messages.push(LmMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: all_calls_json.clone(),
+                tool_call_id: None,
+            });
+            new_messages.push(ConversationMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: all_calls_json,
+                tool_call_id: None,
+                timestamp: now,
+            });
+
+            // Process results; track whether a terminal action was triggered.
+            // reply_result carries (message_text, is_background).
+            let mut reply_result: Option<(String, bool)> = None;
+            let mut return_none = false;
+
+            for (_idx, call_id, tool_name, raw_args, result) in results {
+                let result_str = result.unwrap_or_else(|e| format!("❌ {}", e));
+                match tool_name.as_str() {
+                    "reply_to_user" => {
+                        let bg = raw_args["background"].as_bool().unwrap_or(false);
+                        reply_result = Some((result_str.clone(), bg));
+                        // Always push the tool result so every tool call_id in the
+                        // assistant message has a matching tool result in history.
+                        // Without this, strict LM APIs reject the conversation on the
+                        // next turn (orphaned call_id with no result).
+                        messages.push(LmMessage {
+                            role: "tool".into(),
+                            content: Some(result_str.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "tool".into(),
+                            content: Some(result_str),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                            timestamp: now,
+                        });
+                    }
+                    "nothing" => {
+                        return_none = true;
+                        // Push empty tool result to keep the assistant → tool pair
+                        // well-formed in persisted history (same reason as reply_to_user).
+                        messages.push(LmMessage {
+                            role: "tool".into(),
+                            content: Some(String::new()),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "tool".into(),
+                            content: Some(String::new()),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                            timestamp: now,
+                        });
+                    }
+                    "reflect" => {
+                        if raw_args["done"].as_bool().unwrap_or(false) {
+                            return_none = true;
+                        }
+                        messages.push(LmMessage {
+                            role: "tool".into(),
+                            content: Some(result_str.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "tool".into(),
+                            content: Some(result_str),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                            timestamp: now,
+                        });
+                    }
+                    _ => {
+                        messages.push(LmMessage {
+                            role: "tool".into(),
+                            content: Some(result_str.clone()),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id.clone()),
+                        });
+                        new_messages.push(ConversationMessage {
+                            role: "tool".into(),
+                            content: Some(result_str),
+                            tool_calls: None,
+                            tool_call_id: Some(call_id),
+                            timestamp: now,
+                        });
+                    }
+                }
+            }
+
+            // Handle terminal outcome.
+            if let Some((reply, background)) = reply_result {
+                if send_reply || background {
+                    bot.send_message(ChatId(config.allowed_user_id as i64), reply.clone()).await?;
+                }
+                new_messages.push(ConversationMessage {
+                    role: "assistant".into(),
+                    content: Some(reply.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: now,
+                });
+                if !background {
+                    return Ok((Some(reply), new_messages));
+                }
+                // background=true: tool result already pushed unconditionally in the match arm.
+                // Inject the continuation hint and fall through so the loop iterates.
+                messages.push(LmMessage {
+                    role: "user".into(),
+                    content: Some("[System: Reply sent. Continue working.]".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                tracing::info!(
+                    "Agentic loop iter {}: multi-call reply_to_user(background=true) — reply sent, continuing",
+                    iter + 1
+                );
+                // No return — loop continues naturally.
+            }
+            if return_none {
+                return Ok((None, new_messages));
+            }
+            // No terminal tool → loop continues with updated context.
         }
-
-        tracing::debug!("Agentic loop iter {} result: {:.500}", iter + 1, result);
-
-        // Push tool call + result into context and continue.
-        messages.push(LmMessage {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: single_call_json,
-            tool_call_id: None,
-        });
-        messages.push(LmMessage {
-            role: "tool".into(),
-            content: Some(result),
-            tool_calls: None,
-            tool_call_id: Some(call_id),
-        });
     }
 
-    Ok(None)
+    Ok((None, new_messages))
 }
 
 // ---------------------------------------------------------------------------
