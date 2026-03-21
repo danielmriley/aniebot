@@ -204,6 +204,26 @@ fn tool_schedule_once() -> serde_json::Value {
     })
 }
 
+fn tool_send_update() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "send_update",
+            "description": "Send a progress message to the user now and keep working. Use this to keep the user informed during long tasks — for example, after completing one step and before starting the next. This is NOT your final reply; your final reply will be generated automatically when you finish all your work.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The progress update to send to the user. Be concise and informative."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    })
+}
+
 fn tool_reply_to_user() -> serde_json::Value {
     json!({
         "type": "function",
@@ -460,7 +480,7 @@ fn tool_reflect() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "reflect",
-            "description": "Record an intermediate observation about your current progress. Call this after a series of tool calls to organize your thinking. done=false continues the loop. done=true exits the loop silently — the user will NOT automatically see any reply. In conversations, always call reply_to_user with your findings before using done=true. In background tasks (heartbeat, consolidation), done=true is the correct exit when there is nothing to report.",
+            "description": "Record an intermediate observation about your current progress. Call this after a series of tool calls to organize your thinking. done=false continues the loop. done=true exits the loop — your final reply will be synthesized automatically from your work. In background tasks (heartbeat, consolidation), done=true is the correct exit when there is nothing to report.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -470,7 +490,7 @@ fn tool_reflect() -> serde_json::Value {
                     },
                     "done": {
                         "type": "boolean",
-                        "description": "Set true to exit the loop. WARNING: In conversations this exits silently — you MUST call reply_to_user first if you have findings to share. In background tasks, true is correct when there is nothing to report."
+                        "description": "Set true to exit the loop when your work is complete. Your final reply will be synthesized automatically from everything you did. In background tasks, true is correct when there is nothing to report."
                     }
                 },
                 "required": ["observation", "done"]
@@ -492,7 +512,7 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_delete_schedule(),
         tool_update_schedule(),
         tool_schedule_once(),
-        tool_reply_to_user(),
+        tool_send_update(),
         tool_update_core_memory(false),
         tool_remember(),
         tool_recall(),
@@ -661,6 +681,11 @@ pub async fn dispatch_tool_call(
         .context("Tool call arguments are not valid JSON")?;
 
     match call.function.name.as_str() {
+        "send_update" => {
+            let message = args["message"].as_str()
+                .context("send_update missing 'message' argument")?;
+            Ok(message.to_string())
+        }
         "reply_to_user" => {
             let message = args["message"].as_str()
                 .context("reply_to_user missing 'message' argument")?;

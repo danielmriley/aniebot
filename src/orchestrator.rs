@@ -176,64 +176,41 @@ async fn try_process(
         max_iters,
         false,
     ).await?;
-    let reply = match reply_opt {
-        Some(r) => r,
-        None => {
-            // The agentic loop concluded without calling reply_to_user (e.g. via reflect(done=true)).
-            // Attempt a forced extraction pass using any tool results accumulated in the loop.
-            tracing::warn!("Agentic loop returned no reply — attempting forced extraction pass");
-            let tool_results_text: String = assistant_turns
-                .iter()
-                .filter(|m| m.role == "tool")
-                .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()))
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
-            if !tool_results_text.is_empty() {
-                let extract_messages = vec![
-                    LmMessage {
-                        role: "system".into(),
-                        content: Some("You completed some research. Based on the tool results below, compose a clear, helpful reply for the user. Reply in plain prose — do not call any tools.".into()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                    LmMessage {
-                        role: "user".into(),
-                        content: Some(user_input.to_string()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                    LmMessage {
-                        role: "user".into(),
-                        content: Some(format!("Research results from your tools:\n\n{}", tool_results_text)),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                ];
-                match post_to_lm_studio(&config, &extract_messages, None, 2048).await {
-                    Ok(resp) => {
-                        let raw = resp.choices.into_iter().next()
-                            .and_then(|c| c.message.content)
-                            .unwrap_or_default();
-                        let text = strip_think_blocks(&raw).trim().to_string();
-                        if !text.is_empty() {
-                            tracing::info!("Forced extraction pass succeeded");
-                            text
-                        } else {
-                            tracing::warn!("Forced extraction pass returned empty text");
-                            "I found some results but had trouble summarizing them. Please ask again.".into()
+
+    // Phase 2 — mandatory synthesis. The execution loop handles tool work;
+    // synthesis always produces the final reply from accumulated results.
+    let tool_results_text: String = assistant_turns
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let mut sent_updates: Vec<String> = Vec::new();
+    for msg in &assistant_turns {
+        if msg.role == "assistant" {
+            if let Some(calls_val) = &msg.tool_calls {
+                if let Some(arr) = calls_val.as_array() {
+                    for call in arr {
+                        if call["function"]["name"].as_str() == Some("send_update") {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                call["function"]["arguments"].as_str().unwrap_or("{}")
+                            ) {
+                                if let Some(msg_text) = args["message"].as_str() {
+                                    sent_updates.push(msg_text.to_string());
+                                }
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Forced extraction pass failed: {e}");
-                        "I found some results but had trouble summarizing them. Please ask again.".into()
-                    }
                 }
-            } else {
-                tracing::warn!("Agentic loop returned no reply and no tool results");
-                "I wasn't able to complete that request. Please try again.".into()
             }
         }
-    };
+    }
+    let reply = run_synthesis_call(&config, user_input, &tool_results_text, &sent_updates)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Synthesis call failed: {e}");
+            reply_opt.unwrap_or_else(|| "I had trouble generating a response. Please try again.".into())
+        });
 
     // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
     {
@@ -367,13 +344,68 @@ fn build_system_prompt(
     let now_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
     format!(
-        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nIf the user asks you to do something (find information, run a task, check on something), complete the work using tools first, then reply with results. Do not call reply_to_user before doing the work. When you have results to share, you MUST call reply_to_user — using reflect(done=true) without first calling reply_to_user will end the conversation silently and the user will see nothing.\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nIf the user asks you to do something (find information, run a task, check on something), complete the work using tools first. Use send_update to send progress messages to the user while you work — call it any time you want to share something useful without stopping. When you have finished all your work, call reflect(done=true) — your final reply will be synthesized automatically. You do not need to call any reply tool to send your final response.\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
         core_block = core.to_prompt_block(),
         now_utc = now_utc,
         memory_bullets = memory_bullets,
         episodic_section = episodic_section,
         agenda_section = agenda_section,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Synthesis call — Phase 2 of the two-phase conversation loop
+// ---------------------------------------------------------------------------
+
+async fn run_synthesis_call(
+    config: &Config,
+    user_input: &str,
+    tool_results_text: &str,
+    sent_updates: &[String],
+) -> anyhow::Result<String> {
+    let mut system_content = "You just finished working on the user's request. Write a clear, direct, helpful reply based on what you found and did. Do not call any tools — reply in plain prose only.".to_string();
+    if !sent_updates.is_empty() {
+        system_content.push_str("\n\nYou already sent these progress updates to the user:\n");
+        for (i, update) in sent_updates.iter().enumerate() {
+            system_content.push_str(&format!("{}. {}\n", i + 1, update));
+        }
+        system_content.push_str("\nDo not repeat what is already in those updates. Build on them or provide the final conclusion.");
+    }
+
+    let mut msgs: Vec<LmMessage> = vec![
+        LmMessage {
+            role: "system".into(),
+            content: Some(system_content),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        LmMessage {
+            role: "user".into(),
+            content: Some(user_input.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    if !tool_results_text.is_empty() {
+        msgs.push(LmMessage {
+            role: "user".into(),
+            content: Some(format!("Results from your research and tool calls:\n\n{}", tool_results_text)),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    let resp = post_to_lm_studio(config, &msgs, None, 2048).await?;
+    let raw = resp.choices.into_iter().next()
+        .and_then(|c| c.message.content)
+        .unwrap_or_default();
+    let text = strip_think_blocks(&raw).trim().to_string();
+    if text.is_empty() {
+        anyhow::bail!("Synthesis call returned empty response");
+    }
+    tracing::info!("Synthesis call succeeded ({} chars)", text.len());
+    Ok(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -882,8 +914,7 @@ async fn run_agentic_loop(
                 content: Some(format!(
                     "[System: {} iteration{} remaining in this run. \
                      Wrap up your current work. Queue any unfinished tasks with \
-                     add_agenda_item if available, then conclude with \
-                     reflect(done=true) or reply_to_user.]",
+                     add_agenda_item if available, then conclude with reflect(done=true).]",
                     remaining,
                     if remaining == 1 { "" } else { "s" },
                 )),
@@ -1010,6 +1041,45 @@ async fn run_agentic_loop(
             let dispatch_elapsed = dispatch_start.elapsed();
             tracing::info!("Agentic loop iter {}: tool={} done [tool: {:.1}s]", iter + 1, tool_name, dispatch_elapsed.as_secs_f32());
 
+            if tool_name == "send_update" {
+                bot.send_message(ChatId(config.allowed_user_id as i64), result.clone()).await?;
+                let now = Utc::now();
+                messages.push(LmMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: single_call_json.clone(),
+                    tool_call_id: None,
+                });
+                new_messages.push(ConversationMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: single_call_json,
+                    tool_call_id: None,
+                    timestamp: now,
+                });
+                messages.push(LmMessage {
+                    role: "tool".into(),
+                    content: Some(result.clone()),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                });
+                new_messages.push(ConversationMessage {
+                    role: "tool".into(),
+                    content: Some(result),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id),
+                    timestamp: now,
+                });
+                messages.push(LmMessage {
+                    role: "user".into(),
+                    content: Some("[System: Update sent. Continue working.]".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                tracing::info!("Agentic loop iter {}: send_update — update sent, continuing", iter + 1);
+                continue;
+            }
+
             if tool_name == "reply_to_user" {
                 let background = raw_args["background"].as_bool().unwrap_or(false);
                 if send_reply || background {
@@ -1106,6 +1176,12 @@ async fn run_agentic_loop(
             // ----------------------------------------------------------------
             let all_calls_json = serde_json::to_value(&all_tool_calls).ok();
 
+            // Extract send_update calls first so they are dispatched and sent to the
+            // user before parallel work begins — progress is visible without extra wait.
+            let (immediate_calls, all_tool_calls): (Vec<_>, Vec<_>) = all_tool_calls
+                .into_iter()
+                .partition(|c| c.function.name == "send_update");
+
             let all_parallel_safe = all_tool_calls
                 .iter()
                 .all(|c| PARALLEL_SAFE_TOOLS.contains(&c.function.name.as_str()));
@@ -1119,8 +1195,28 @@ async fn run_agentic_loop(
             // Dispatch type alias: (original_index, call_id, tool_name, raw_args, result)
             type DispatchItem = (usize, String, String, serde_json::Value, anyhow::Result<String>);
 
+            // --- Dispatch send_update calls immediately (before parallel work) ---
+            let mut results: Vec<DispatchItem> = {
+                let mut v: Vec<DispatchItem> = Vec::new();
+                for (i, call) in immediate_calls.into_iter().enumerate() {
+                    let raw_args: serde_json::Value =
+                        serde_json::from_str(&call.function.arguments).unwrap_or_default();
+                    let call_id = call.id.clone();
+                    let tool_name = call.function.name.clone();
+                    let r = tools::dispatch_tool_call(
+                        call_config.clone(), bot.clone(), scheduler.clone(), call,
+                    ).await;
+                    if let Ok(ref msg) = r {
+                        let _ = bot.send_message(ChatId(config.allowed_user_id as i64), msg.clone()).await;
+                        tracing::info!("Agentic loop iter {}: send_update (multi) — update sent", iter + 1);
+                    }
+                    v.push((i, call_id, tool_name, raw_args, r));
+                }
+                v
+            };
+            let base_immediate = results.len();
             // --- Dispatch non-terminal tools ---
-            let mut results: Vec<DispatchItem> = if all_parallel_safe && terminal_calls.is_empty() {
+            let other_results: Vec<DispatchItem> = if all_parallel_safe && terminal_calls.is_empty() {
                 // All calls are safe to run in parallel.
                 let mut join_set: tokio::task::JoinSet<DispatchItem> = tokio::task::JoinSet::new();
                 for (idx, call) in other_calls.into_iter().enumerate() {
@@ -1155,6 +1251,10 @@ async fn run_agentic_loop(
                 }
                 raw
             };
+            for (i, item) in other_results.into_iter().enumerate() {
+                let (_, call_id, tool_name, raw_args, r) = item;
+                results.push((base_immediate + i, call_id, tool_name, raw_args, r));
+            }
 
             // --- Append terminal tools (sequential, after all others) ---
             let base_idx = results.len();
