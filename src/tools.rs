@@ -229,7 +229,8 @@ fn tool_reply_to_user() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "reply_to_user",
-            "description": "Send a direct conversational reply to the user. IMPORTANT: Only call this AFTER you have completed the requested work. If the user asked you to do something (search, fetch data, run a task), do it first with delegate_cli or other tools, then call this with the results. Use this for: greetings; thank-yous; reactions to information you just provided; opinion and discussion questions; casual conversation; anything that does not require fetching new external data. Do NOT call this first and skip the work.",
+            "description": "Send your reply to the user. This is the primary way to respond. Use it immediately for conversational messages, greetings, reactions, opinions, and anything not requiring external data. For research tasks, complete the work first with delegate_cli or other tools, then call this with your findings. If the research involved many tool calls and you want a polished synthesis instead, call reflect(done=true) — otherwise just call this with the result yourself.",
+            "description_note": "Do NOT call this before doing requested work. Do NOT use background=true unless you genuinely have more work to continue after replying.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -480,7 +481,7 @@ fn tool_reflect() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "reflect",
-            "description": "Record an intermediate observation about your current progress. Call this after a series of tool calls to organize your thinking. done=false continues the loop. done=true exits the loop — your final reply will be synthesized automatically from your work. In background tasks (heartbeat, consolidation), done=true is the correct exit when there is nothing to report.",
+            "description": "Record an intermediate observation about your current progress. Call this after a series of tool calls to organize your thinking. done=false continues the loop. done=true exits the loop — a reply will be synthesized automatically from your work. Supply the optional reply field if you already know what you want to say; synthesis will use it as a starting point. In background tasks (heartbeat, consolidation), done=true is the correct exit when there is nothing to report.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -490,7 +491,11 @@ fn tool_reflect() -> serde_json::Value {
                     },
                     "done": {
                         "type": "boolean",
-                        "description": "Set true to exit the loop when your work is complete. Your final reply will be synthesized automatically from everything you did. In background tasks, true is correct when there is nothing to report."
+                        "description": "Set true to exit the loop when your work is complete. A reply will be synthesized from everything you did. In background tasks, true is correct when there is nothing to report."
+                    },
+                    "reply": {
+                        "type": "string",
+                        "description": "Optional: if you know what you want to say to the user, put it here. Synthesis will use this as a starting point and polish it. Omit to let the harness compose the reply entirely from your tool results."
                     }
                 },
                 "required": ["observation", "done"]
@@ -513,6 +518,7 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_update_schedule(),
         tool_schedule_once(),
         tool_send_update(),
+        tool_reply_to_user(),
         tool_update_core_memory(false),
         tool_remember(),
         tool_recall(),

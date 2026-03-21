@@ -154,11 +154,17 @@ async fn try_process(
     let mut messages: Vec<LmMessage> = Vec::with_capacity(1 + history_window.len() + 1);
     messages.push(LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None });
     for msg in history_window {
+        // Skip tool-call and tool-result turns — only pass clean text messages into context.
+        // Tool calls from previous turns must not bleed into the new turn and tempt the model
+        // to re-execute them.
+        if msg.tool_calls.is_some() || msg.tool_call_id.is_some() {
+            continue;
+        }
         messages.push(LmMessage {
             role: msg.role.clone(),
             content: msg.content.clone(),
-            tool_calls: msg.tool_calls.clone(),
-            tool_call_id: msg.tool_call_id.clone(),
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
     messages.push(LmMessage { role: "user".into(), content: Some(user_input.to_string()), tool_calls: None, tool_call_id: None });
@@ -177,26 +183,43 @@ async fn try_process(
         false,
     ).await?;
 
-    // Phase 2 — mandatory synthesis. The execution loop handles tool work;
-    // synthesis always produces the final reply from accumulated results.
-    let tool_results_text: String = assistant_turns
-        .iter()
-        .filter(|m| m.role == "tool")
-        .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
-    let mut sent_updates: Vec<String> = Vec::new();
-    for msg in &assistant_turns {
-        if msg.role == "assistant" {
-            if let Some(calls_val) = &msg.tool_calls {
-                if let Some(arr) = calls_val.as_array() {
-                    for call in arr {
-                        if call["function"]["name"].as_str() == Some("send_update") {
-                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(
-                                call["function"]["arguments"].as_str().unwrap_or("{}")
-                            ) {
-                                if let Some(msg_text) = args["message"].as_str() {
-                                    sent_updates.push(msg_text.to_string());
+    // Phase 2 — direct reply or synthesis.
+    // reply_to_user exit → Some(text): send directly, skip synthesis (fast path).
+    // reflect(done=true) / exhausted → None: synthesize from accumulated tool results.
+    let reply = if let Some(direct) = reply_opt {
+        tracing::info!("Conversation: direct reply path (reply_to_user)");
+        direct
+    } else {
+        let tool_results_text: String = assistant_turns
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref().filter(|c| !c.is_empty()))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+        let mut sent_updates: Vec<String> = Vec::new();
+        let mut reflect_reply_hint: Option<String> = None;
+        for msg in &assistant_turns {
+            if msg.role == "assistant" {
+                if let Some(calls_val) = &msg.tool_calls {
+                    if let Some(arr) = calls_val.as_array() {
+                        for call in arr {
+                            let name = call["function"]["name"].as_str().unwrap_or("");
+                            if name == "send_update" {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                    call["function"]["arguments"].as_str().unwrap_or("{}")
+                                ) {
+                                    if let Some(msg_text) = args["message"].as_str() {
+                                        sent_updates.push(msg_text.to_string());
+                                    }
+                                }
+                            } else if name == "reflect" {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(
+                                    call["function"]["arguments"].as_str().unwrap_or("{}")
+                                ) {
+                                    if args["done"].as_bool().unwrap_or(false) {
+                                        // Last reflect(done=true) — extract reply hint if provided.
+                                        reflect_reply_hint = args["reply"].as_str().map(|s| s.to_string());
+                                    }
                                 }
                             }
                         }
@@ -204,13 +227,13 @@ async fn try_process(
                 }
             }
         }
-    }
-    let reply = run_synthesis_call(&config, user_input, &tool_results_text, &sent_updates)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("Synthesis call failed: {e}");
-            reply_opt.unwrap_or_else(|| "I had trouble generating a response. Please try again.".into())
-        });
+        run_synthesis_call(&config, user_input, &tool_results_text, &sent_updates, reflect_reply_hint.as_deref())
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Synthesis call failed: {e}");
+                "I had trouble generating a response. Please try again.".into()
+            })
+    };
 
     // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
     {
@@ -224,12 +247,13 @@ async fn try_process(
         });
     }
 
-    // Persist the user turn + whatever history entries dispatch_response produced.
+    // Persist only the clean user/reply pair — tool calls are intentionally excluded.
+    // Storing raw tool calls causes the model to re-execute them on the next turn.
     let now = Utc::now();
-    let mut turns = vec![
+    let turns = vec![
         ConversationMessage { role: "user".into(), content: Some(user_input.to_string()), tool_calls: None, tool_call_id: None, timestamp: now },
+        ConversationMessage { role: "assistant".into(), content: Some(reply.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
     ];
-    turns.extend(assistant_turns);
     if let Err(e) = memory::append_messages(chat_id, &turns).await {
         tracing::warn!("Failed to persist conversation: {}", e);
     }
@@ -344,7 +368,7 @@ fn build_system_prompt(
     let now_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
     format!(
-        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nIf the user asks you to do something (find information, run a task, check on something), complete the work using tools first. Use send_update to send progress messages to the user while you work — call it any time you want to share something useful without stopping. When you have finished all your work, call reflect(done=true) — your final reply will be synthesized automatically. You do not need to call any reply tool to send your final response.\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nThe conversation history is for context only — do not repeat or continue tool calls from previous turns. Only act on the most recent user message.\n\nHow to respond:\n- For conversational messages, greetings, reactions, opinions, or anything requiring no external data — call reply_to_user directly.\n- For tasks requiring research or multiple tool calls — use tools first. Use send_update for progress messages while working. Then either call reply_to_user with your findings, or call reflect(done=true) to have a polished reply synthesized automatically from all your work (optionally provide a reply hint in the reflect call).\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
         core_block = core.to_prompt_block(),
         now_utc = now_utc,
         memory_bullets = memory_bullets,
@@ -362,8 +386,12 @@ async fn run_synthesis_call(
     user_input: &str,
     tool_results_text: &str,
     sent_updates: &[String],
+    reply_hint: Option<&str>,
 ) -> anyhow::Result<String> {
     let mut system_content = "You just finished working on the user's request. Write a clear, direct, helpful reply based on what you found and did. Do not call any tools — reply in plain prose only.".to_string();
+    if let Some(hint) = reply_hint {
+        system_content.push_str(&format!("\n\nThe assistant intended to communicate: {}\nUse this as the basis for your reply, expanding and polishing as needed.", hint));
+    }
     if !sent_updates.is_empty() {
         system_content.push_str("\n\nYou already sent these progress updates to the user:\n");
         for (i, update) in sent_updates.iter().enumerate() {
@@ -812,8 +840,9 @@ async fn run_agentic_loop(
     // Accumulates every new message produced during the loop for the caller to persist.
     let mut new_messages: Vec<ConversationMessage> = Vec::new();
 
-    // 1.5B — Anti-stall: track previous call to detect identical duplicates.
-    let mut last_call_fingerprint: Option<(String, String)> = None;
+    // 1.5B — Anti-stall: track ALL seen fingerprints, not just the last.
+    // This catches alternating loops (A-B-A-B) as well as consecutive repeats (A-A).
+    let mut seen_fingerprints: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut anti_stall_injected = false;
 
     // 1.5C — Budget exhaustion: warn the model at 80% consumption.
@@ -972,59 +1001,50 @@ async fn run_agentic_loop(
             let call_id = call.id.clone();
             let raw_args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap_or_default();
 
-            // 1.5B — Anti-stall: if the model repeats the exact same call, dispatch it
-            // (to keep the transcript valid), then inject a warning before the next LM call.
+            // 1.5B — Anti-stall: any repeated (tool, args) fingerprint within the same turn
+            // triggers the warning once.  Uses a HashSet so alternating A-B-A-B loops are caught
+            // just as reliably as consecutive A-A repeats.
             let current_fingerprint = (tool_name.clone(), call.function.arguments.clone());
-            if !anti_stall_injected {
-                if let Some(ref last) = last_call_fingerprint {
-                    if *last == current_fingerprint {
-                        tracing::warn!(
-                            "Agentic loop iter {}: anti-stall triggered (repeated {})",
-                            iter + 1, tool_name
-                        );
-                        let dispatch_start = std::time::Instant::now();
-                        let result = tools::dispatch_tool_call(
-                            call_config.clone(), bot.clone(), scheduler.clone(), call,
-                        ).await?;
-                        let dispatch_elapsed = dispatch_start.elapsed();
-                        tracing::info!(
-                            "Agentic loop iter {}: tool={} done [tool: {:.1}s]",
-                            iter + 1, tool_name, dispatch_elapsed.as_secs_f32()
-                        );
-                        let now = Utc::now();
-                        messages.push(LmMessage {
-                            role: "assistant".into(), content: None,
-                            tool_calls: single_call_json.clone(), tool_call_id: None,
-                        });
-                        new_messages.push(ConversationMessage {
-                            role: "assistant".into(), content: None,
-                            tool_calls: single_call_json, tool_call_id: None, timestamp: now,
-                        });
-                        messages.push(LmMessage {
-                            role: "tool".into(), content: Some(result.clone()),
-                            tool_calls: None, tool_call_id: Some(call_id.clone()),
-                        });
-                        new_messages.push(ConversationMessage {
-                            role: "tool".into(), content: Some(result),
-                            tool_calls: None, tool_call_id: Some(call_id), timestamp: now,
-                        });
-                        messages.push(LmMessage {
-                            role: "user".into(),
-                            content: Some(format!(
-                                "[System: You just called `{}` with the same arguments twice in a row. \
-                                 This looks like a loop. Try a different tool or approach, \
-                                 or call reflect(done=true) to conclude.]",
-                                tool_name
-                            )),
-                            tool_calls: None, tool_call_id: None,
-                        });
-                        anti_stall_injected = true;
-                        last_call_fingerprint = Some(current_fingerprint);
-                        continue;
-                    }
-                }
+            if !anti_stall_injected && !seen_fingerprints.insert(current_fingerprint.clone()) {
+                tracing::warn!(
+                    "Agentic loop iter {}: anti-stall triggered (repeated {})",
+                    iter + 1, tool_name
+                );
+                // Use a synthetic result — avoid re-executing the same expensive tool.
+                let result = "[Already completed — results are already in your context above. \
+                               Do not repeat this call. Review the results, then call \
+                               reply_to_user with your answer or reflect(done=true) to wrap up.]"
+                    .to_string();
+                let now = Utc::now();
+                messages.push(LmMessage {
+                    role: "assistant".into(), content: None,
+                    tool_calls: single_call_json.clone(), tool_call_id: None,
+                });
+                new_messages.push(ConversationMessage {
+                    role: "assistant".into(), content: None,
+                    tool_calls: single_call_json, tool_call_id: None, timestamp: now,
+                });
+                messages.push(LmMessage {
+                    role: "tool".into(), content: Some(result.clone()),
+                    tool_calls: None, tool_call_id: Some(call_id.clone()),
+                });
+                new_messages.push(ConversationMessage {
+                    role: "tool".into(), content: Some(result),
+                    tool_calls: None, tool_call_id: Some(call_id), timestamp: now,
+                });
+                messages.push(LmMessage {
+                    role: "user".into(),
+                    content: Some(format!(
+                        "[System: You already ran `{}` with these exact arguments earlier this turn. \
+                         Stop repeating tool calls. Review results in your context above, \
+                         then call reply_to_user with your answer or reflect(done=true) to wrap up.]",
+                        tool_name
+                    )),
+                    tool_calls: None, tool_call_id: None,
+                });
+                anti_stall_injected = true;
+                continue;
             }
-            last_call_fingerprint = Some(current_fingerprint);
 
             // Exact-duplicate backstop: if the model makes the identical reflect call twice, exit.
             if tool_name == "reflect" {
