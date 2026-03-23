@@ -22,6 +22,9 @@ pub struct Config {
     pub max_iters_agenda: usize,
     pub context_compress_threshold: usize,
     pub background_lm_model: Option<String>,
+    pub session_gap_hours: u64,
+    pub session_summary_min_messages: usize,
+    pub history_max_stored: usize,
 }
 
 impl Config {
@@ -88,6 +91,21 @@ impl Config {
 
         let background_lm_model = std::env::var("BACKGROUND_LM_MODEL").ok();
 
+        let session_gap_hours = std::env::var("SESSION_GAP_HOURS")
+            .unwrap_or_else(|_| "2".into())
+            .parse::<u64>()
+            .context("SESSION_GAP_HOURS must be a valid integer")?;
+
+        let session_summary_min_messages = std::env::var("SESSION_SUMMARY_MIN_MESSAGES")
+            .unwrap_or_else(|_| "6".into())
+            .parse::<usize>()
+            .context("SESSION_SUMMARY_MIN_MESSAGES must be a valid integer")?;
+
+        let history_max_stored = std::env::var("HISTORY_MAX_STORED")
+            .unwrap_or_else(|_| "500".into())
+            .parse::<usize>()
+            .context("HISTORY_MAX_STORED must be a valid integer")?;
+
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
             .parse::<u64>()
@@ -112,6 +130,9 @@ impl Config {
             max_iters_agenda,
             context_compress_threshold,
             background_lm_model,
+            session_gap_hours,
+            session_summary_min_messages,
+            history_max_stored,
         })
     }
 }

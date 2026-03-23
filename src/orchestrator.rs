@@ -14,7 +14,7 @@ use crate::scheduler::SchedulerHandle;
 use crate::tools;
 
 const HISTORY_WINDOW: usize = 6;
-const MEMORY_ENTRIES: usize = 8;
+const MEMORY_ENTRIES: usize = 5;
 
 // ---------------------------------------------------------------------------
 // LM Studio API types
@@ -137,6 +137,39 @@ async fn try_process(
     let window_start = history.len().saturating_sub(HISTORY_WINDOW * 3);
     let history_window = &history[window_start..];
 
+    // Compute elapsed time since last activity for session detection and prompt injection.
+    let elapsed_since_last: Option<chrono::Duration> = core.last_activity_at
+        .or_else(|| history.last().map(|m| m.timestamp))
+        .map(|t| Utc::now() - t);
+
+    let is_resuming_session = elapsed_since_last
+        .map(|d| d.num_hours() >= config.session_gap_hours as i64)
+        .unwrap_or(false)
+        && history.len() >= config.session_summary_min_messages;
+
+    // If resuming after a gap, block on a brief session summary (first turn only).
+    let session_summary: Option<String> = if is_resuming_session {
+        let summary_config = Config {
+            model_name: config.background_lm_model
+                .as_deref()
+                .unwrap_or(&config.model_name)
+                .to_string(),
+            ..(*config).clone()
+        };
+        match run_session_summary(&summary_config, history_window).await {
+            Ok(s) => {
+                tracing::info!("Session summary generated ({} chars)", s.len());
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!("Session summary failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build system prompt — personality + memory only.
     // Routing is handled by the structured tool definitions, not prompt instructions.
     let memory_bullets: String = if recent_memory.is_empty() {
@@ -144,11 +177,18 @@ async fn try_process(
     } else {
         recent_memory
             .iter()
-            .map(|e| format!("- [{}] User: {} → You: {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.user_msg, e.assistant_reply))
+            .map(|e| {
+                // Truncate the stored reply to a short preview — memory bullets are flavor hints,
+                // not full transcripts. A long stored reply (e.g. a research guide) must not be
+                // re-injected verbatim or the model will reproduce it on unrelated turns.
+                let preview: String = e.assistant_reply.chars().take(150).collect();
+                let suffix = if e.assistant_reply.chars().count() > 150 { "…" } else { "" };
+                format!("- [{}] User: {} → You: {}{}", e.timestamp.format("%Y-%m-%d %H:%M"), e.user_msg, preview, suffix)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let system_prompt = build_system_prompt(&core, &memory_bullets, &recent_episodic, &pending_agenda);
+    let system_prompt = build_system_prompt(&core, &memory_bullets, &recent_episodic, &pending_agenda, session_summary.as_deref(), elapsed_since_last);
 
     // Build messages array.
     let mut messages: Vec<LmMessage> = Vec::with_capacity(1 + history_window.len() + 1);
@@ -235,17 +275,22 @@ async fn try_process(
             })
     };
 
-    // Memory eval pass — fire-and-forget after reply is ready, zero latency impact.
-    {
-        let config_eval = config.clone();
-        let user_snapshot = user_input.to_string();
-        let reply_snapshot = reply.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_memory_eval(config_eval, user_snapshot, reply_snapshot).await {
+    // Memory eval pass — awaited so we can gate store_interaction on the result.
+    // Uses BACKGROUND_LM_MODEL if configured to keep on-path latency low.
+    let eval_notable = {
+        let eval_model = config.background_lm_model
+            .as_deref()
+            .unwrap_or(&config.model_name)
+            .to_string();
+        let eval_config = Arc::new(Config { model_name: eval_model, ..(*config).clone() });
+        match run_memory_eval(eval_config, user_input.to_string(), reply.clone()).await {
+            Ok(notable) => notable,
+            Err(e) => {
                 tracing::warn!("Memory eval pass failed: {e}");
+                true // fail-open: store if eval errors
             }
-        });
-    }
+        }
+    };
 
     // Persist only the clean user/reply pair — tool calls are intentionally excluded.
     // Storing raw tool calls causes the model to re-execute them on the next turn.
@@ -254,11 +299,15 @@ async fn try_process(
         ConversationMessage { role: "user".into(), content: Some(user_input.to_string()), tool_calls: None, tool_call_id: None, timestamp: now },
         ConversationMessage { role: "assistant".into(), content: Some(reply.clone()), tool_calls: None, tool_call_id: None, timestamp: now },
     ];
-    if let Err(e) = memory::append_messages(chat_id, &turns).await {
+    if let Err(e) = memory::append_messages(chat_id, &turns, config.history_max_stored).await {
         tracing::warn!("Failed to persist conversation: {}", e);
     }
-    if let Err(e) = memory::store_interaction(chat_id, user_input, &reply).await {
-        tracing::warn!("Failed to write memory log: {}", e);
+    if eval_notable {
+        if let Err(e) = memory::store_interaction(chat_id, user_input, &reply).await {
+            tracing::warn!("Failed to write memory log: {}", e);
+        }
+    } else {
+        tracing::info!("Memory eval: nothing notable — skipping interaction log");
     }
 
     // Consolidation trigger — fire-and-forget if enough new episodic entries have
@@ -279,6 +328,21 @@ async fn try_process(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("count_since failed: {e}"),
+            }
+        });
+    }
+
+    // Update last_activity_at and clear session_summary after use — fire-and-forget.
+    {
+        let used_summary = is_resuming_session;
+        tokio::spawn(async move {
+            if let Err(e) = crate::core_memory::update_last_activity().await {
+                tracing::warn!("Failed to update last_activity_at: {e}");
+            }
+            if used_summary {
+                if let Err(e) = crate::core_memory::update_session_summary(None).await {
+                    tracing::warn!("Failed to clear session_summary: {e}");
+                }
             }
         });
     }
@@ -334,6 +398,8 @@ fn build_system_prompt(
     memory_bullets: &str,
     episodic_entries: &[crate::episodic::EpisodicEntry],
     pending_agenda: &[crate::agenda::AgendaItem],
+    session_summary: Option<&str>,
+    elapsed_since_last: Option<chrono::Duration>,
 ) -> String {
     let notable: Vec<String> = episodic_entries
         .iter()
@@ -367,10 +433,44 @@ fn build_system_prompt(
 
     let now_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
+    // Elapsed time — only shown for gaps >= 1 hour to avoid cluttering same-session messages.
+    let elapsed_str = match elapsed_since_last {
+        Some(d) if d.num_hours() >= 1 => {
+            let total_hours = d.num_hours();
+            let days = total_hours / 24;
+            let hours = total_hours % 24;
+            if days > 0 {
+                format!("\nTime since last conversation: {} day{}, {} hour{}",
+                    days, if days == 1 { "" } else { "s" },
+                    hours, if hours == 1 { "" } else { "s" })
+            } else {
+                format!("\nTime since last conversation: {} hour{}",
+                    hours, if hours == 1 { "" } else { "s" })
+            }
+        }
+        _ => String::new(),
+    };
+
+    // Only coach the model about gaps >= 24 hours; shorter gaps need no acknowledgement.
+    let gap_instruction = match elapsed_since_last {
+        Some(d) if d.num_hours() >= 24 =>
+            "\n\nIf more than 24 hours have passed since your last conversation, you may \
+             acknowledge the gap once, briefly and naturally — don't narrate short gaps or repeat it.",
+        _ => "",
+    };
+
+    let session_section = match session_summary {
+        Some(s) => format!("\n\n## Picking Up Where We Left Off\n{}", s),
+        None => String::new(),
+    };
+
     format!(
-        "{core_block}\n\nCurrent UTC time: {now_utc}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nThe conversation history is for context only — do not repeat or continue tool calls from previous turns. Only act on the most recent user message.\n\nHow to respond:\n- For conversational messages, greetings, reactions, opinions, or anything requiring no external data — call reply_to_user directly.\n- For tasks requiring research or multiple tool calls — use tools first. Use send_update for progress messages while working. Then either call reply_to_user with your findings, or call reflect(done=true) to have a polished reply synthesized automatically from all your work (optionally provide a reply hint in the reflect call).\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}{elapsed_str}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nYour '## Current Beliefs' are hard-won conclusions from your experience — bring them into conversation naturally when they're relevant.\n\nThe conversation history is for context only — do not repeat or continue tool calls from previous turns. Only act on the most recent user message.\n\nHow to respond:\n- For conversational messages, greetings, reactions, opinions, or anything requiring no external data — call reply_to_user directly.\n- For tasks requiring research or multiple tool calls — use tools first. Use send_update for progress messages while working. Then either call reply_to_user with your findings, or call reflect(done=true) to have a polished reply synthesized automatically from all your work (optionally provide a reply hint in the reflect call).\n- If the user references a past event, something from a previous session, or asks what you've discussed before — call recall() with relevant keywords before answering. Your episodic memory stores specific moments, discoveries, and events across all sessions.{gap_instruction}{session_section}\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
         core_block = core.to_prompt_block(),
         now_utc = now_utc,
+        elapsed_str = elapsed_str,
+        gap_instruction = gap_instruction,
+        session_section = session_section,
         memory_bullets = memory_bullets,
         episodic_section = episodic_section,
         agenda_section = agenda_section,
@@ -656,14 +756,14 @@ async fn try_run_consolidation(
     let identity_question = if high_sig.is_empty() {
         ""
     } else {
-        "\n5. Did any high-significance event fundamentally change who you are or what you stand for? → update_core_memory(\"identity\", ...) [minimum surgical edit — add, revise, or remove only the specific clause that changed; do not rewrite wholesale]"
+        "\n5. How have you evolved through these experiences? What would you say about who you are becoming? What has this period of interactions added or shifted in who you are? → update_core_memory(\"identity\", ...) [minimum surgical edit — add, revise, or remove only the specific clause that changed; do not rewrite wholesale]"
     };
 
     let system_prompt = format!(
         "{core_block}\n\n## Recent Episodic Observations\n{episodic_block}{high_sig_section}\n\n\
 You are in consolidation mode. Make a single, complete pass through these observations and call tools as needed:\n\
-1. Did you learn anything new or significant about the user? → update_core_memory(\"user_profile\", ...) [replace the full field with the updated text]\n\
-2. Did anything refine your beliefs or opinions? → update_core_memory(\"beliefs\", ...) [JSON array string, e.g. \"[\\\"Formal verification is underutilized in industry\\\", \\\"Daniel values deep work over shallow multitasking\\\"]\"] Be direct — record concrete first-person conclusions, not vague observations.\n\
+1. How has your understanding of Daniel as a person deepened? What do you know now about who he is, what matters to him, or what shapes his thinking? → update_core_memory(\"user_profile\", ...) [replace the full field with the updated text]\n\
+2. Given everything in your recent episodic memory, what do you now believe that you didn't before, or believe more strongly? → update_core_memory(\"beliefs\", ...) [JSON array string, e.g. \"[\\\"Formal verification is underutilized in industry\\\", \\\"Daniel values deep work over shallow multitasking\\\"]\"] Be direct — record concrete first-person conclusions, not vague observations.\n\
 3. Any observations worth preserving permanently? → remember(content, tags, 5)\n\
 4. Did any unresolved questions or interesting topics come up worth investigating later? → update_core_memory(\"curiosity_queue\", ...) [JSON array of short topic strings, e.g. \"[\\\"How does Lean 4 compare to Coq for software verification?\\\"]\"]. Add to existing items, don't replace them.\n\
 5. Any interests to add or retire? → add_interest / retire_interest{identity_question}\n\
@@ -1433,6 +1533,64 @@ async fn run_agentic_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Session summary — generated on the first turn of a resumed session
+// ---------------------------------------------------------------------------
+
+/// Summarise recent history in 2–3 sentences so the bot can pick up naturally
+/// after a gap. Uses the background LM model when configured.
+async fn run_session_summary(
+    config: &Config,
+    history_window: &[ConversationMessage],
+) -> anyhow::Result<String> {
+    // Format exchange as plain text pairs; skip tool-call / tool-result turns.
+    let exchange: String = history_window
+        .iter()
+        .filter(|m| m.tool_calls.is_none() && m.tool_call_id.is_none())
+        .filter_map(|m| m.content.as_deref().map(|c| (m.role.as_str(), c)))
+        .map(|(role, content)| {
+            let label = if role == "user" { "User" } else { "Assistant" };
+            format!("{}: {}", label, content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if exchange.trim().is_empty() {
+        anyhow::bail!("run_session_summary: history_window produced empty exchange text");
+    }
+
+    let messages = vec![
+        LmMessage {
+            role: "system".into(),
+            content: Some(
+                "Summarize the following recent conversation in 2–3 sentences. \
+                 Capture: what was discussed, what was accomplished or decided, and where it was left off. \
+                 Be specific but concise. This summary will be shown to you at the start of the next \
+                 session so you can pick up naturally.".into(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        LmMessage {
+            role: "user".into(),
+            content: Some(exchange),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let response = post_to_lm_studio(config, &messages, None, 512).await?;
+    let choice = response.choices.into_iter().next()
+        .context("Session summary: LM Studio returned no choices")?;
+    let raw = choice.message.content
+        .context("Session summary: response had no content")?;
+    let summary = strip_think_blocks(&raw).trim().to_string();
+    if summary.is_empty() {
+        anyhow::bail!("Session summary: model returned empty content");
+    }
+    Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
 // Memory evaluation pass (post-response, fire-and-forget)
 // ---------------------------------------------------------------------------
 
@@ -1443,7 +1601,7 @@ async fn run_memory_eval(
     config: Arc<Config>,
     user_msg: String,
     assistant_reply: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let eval_tools = json!([
         {
             "type": "function",
@@ -1539,13 +1697,13 @@ async fn run_memory_eval(
     tracing::info!("Memory eval finish_reason: {}", choice.finish_reason);
     if choice.finish_reason == "length" {
         tracing::warn!("Memory eval response truncated — skipping");
-        return Ok(());
+        return Ok(false);
     }
     let call = match choice.message.tool_calls.into_iter().next() {
         Some(c) => c,
         None => {
             tracing::info!("Memory eval: no tool call in response — skipping");
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -1559,7 +1717,7 @@ async fn run_memory_eval(
         tracing::info!("Memory eval updated core memory section '{section}'");
     }
 
-    Ok(())
+    Ok(call.function.name == "update_core_memory")
 }
 
 // ---------------------------------------------------------------------------

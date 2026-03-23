@@ -52,11 +52,16 @@ pub async fn load_history(chat_id: i64) -> anyhow::Result<Vec<ConversationMessag
 pub async fn append_messages(
     chat_id: i64,
     messages: &[ConversationMessage],
+    max_stored: usize,
 ) -> anyhow::Result<()> {
     let path = format!("{}/{}.json", CONVERSATIONS_DIR, chat_id);
     let tmp_path = format!("{}/{}.json.tmp", CONVERSATIONS_DIR, chat_id);
     let mut history = load_history(chat_id).await?;
     history.extend_from_slice(messages);
+    if history.len() > max_stored {
+        let drain_count = history.len() - max_stored;
+        history.drain(..drain_count);
+    }
     tokio::fs::write(&tmp_path, serde_json::to_vec_pretty(&history)?).await?;
     tokio::fs::rename(&tmp_path, &path).await?;
     Ok(())
@@ -74,7 +79,7 @@ pub async fn store_interaction(
     let entry = MemoryEntry {
         chat_id,
         user_msg: user_msg.to_string(),
-        assistant_reply: assistant_reply.to_string(),
+        assistant_reply: assistant_reply.chars().take(200).collect::<String>(),
         timestamp: Utc::now(),
     };
 

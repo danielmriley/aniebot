@@ -306,7 +306,7 @@ fn tool_remember() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "remember",
-            "description": "Log a specific observation, fact, or event to episodic memory for future recall. Use for things too detailed or transient for core memory — e.g. a specific conversation moment, a user preference detail, or a one-off event. Use importance 5 for consolidation-promoted facts.",
+            "description": "Log a notable moment, discovery, or event to episodic memory. Use this during or after any exchange where something significant happened — a task completed, something surprising found, a meaningful decision made, a strong preference expressed. This is how your understanding accumulates across sessions.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -25,6 +25,12 @@ pub struct CoreMemory {
     /// Current active task or project being worked on. Injected into every system prompt.
     #[serde(default)]
     pub current_task: Option<String>,
+    /// Summary of the previous session, injected once at the start of a resumed session.
+    #[serde(default)]
+    pub session_summary: Option<String>,
+    /// Timestamp of the last assistant reply — used to compute elapsed time for session detection.
+    #[serde(default)]
+    pub last_activity_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -48,6 +54,8 @@ impl Default for CoreMemory {
             curiosity_queue: Vec::new(),
             last_consolidation_at: None,
             current_task: None,
+            session_summary: None,
+            last_activity_at: None,
         }
     }
 }
@@ -214,5 +222,19 @@ pub async fn set_task(description: &str) -> Result<()> {
 pub async fn clear_task() -> Result<()> {
     let mut cm = load().await?;
     cm.current_task = None;
+    save(&cm).await
+}
+
+/// Record the current time as the last activity timestamp.
+pub async fn update_last_activity() -> Result<()> {
+    let mut cm = load().await?;
+    cm.last_activity_at = Some(Utc::now());
+    save(&cm).await
+}
+
+/// Set or clear the session summary field.
+pub async fn update_session_summary(summary: Option<String>) -> Result<()> {
+    let mut cm = load().await?;
+    cm.session_summary = summary;
     save(&cm).await
 }
