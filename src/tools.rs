@@ -434,6 +434,26 @@ fn tool_forget() -> serde_json::Value {
     })
 }
 
+fn tool_final_reply() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "final_reply",
+            "description": "Send a complete, polished reply to the user and end this session. Use this when you have finished all your work and are ready to present results. Unlike reply_to_user, this always terminates the session immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The complete reply to send to the user."
+                    }
+                },
+                "required": ["text"]
+            }
+        }
+    })
+}
+
 fn tool_nothing(description: &str) -> serde_json::Value {
     json!({
         "type": "function",
@@ -519,6 +539,7 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_schedule_once(),
         tool_send_update(),
         tool_reply_to_user(),
+        tool_final_reply(),
         tool_update_core_memory(false),
         tool_remember(),
         tool_recall(),
@@ -551,6 +572,7 @@ pub fn heartbeat_tool_definitions() -> serde_json::Value {
         tool_delegate_cli(),
         tool_fetch_url(),
         tool_reply_to_user(),
+        tool_final_reply(),
         tool_add_interest(),
         tool_retire_interest(),
         tool_update_core_memory(false),
@@ -573,6 +595,7 @@ pub fn consolidation_tool_definitions() -> serde_json::Value {
     json!([
         tool_update_core_memory(true),
         tool_fetch_url(),
+        tool_final_reply(),
         tool_remember(),
         tool_add_interest(),
         tool_retire_interest(),
@@ -706,6 +729,10 @@ pub async fn dispatch_tool_call(
             let message = args["message"].as_str()
                 .context("reply_to_user missing 'message' argument")?;
             Ok(message.to_string())
+        }
+        "final_reply" => {
+            let text = args["text"].as_str().unwrap_or("").to_string();
+            Ok(text)
         }
         "delegate_cli" => {
             let task = args["task"].as_str()
