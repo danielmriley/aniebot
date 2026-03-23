@@ -25,6 +25,7 @@ For **non-trivial tasks** use these sections in order. For tiny requests you may
 - Explain why this approach is best (and why alternatives are worse).
 - Address edge cases, performance, security, scalability, maintainability, and testing strategy.
 - For larger changes, propose phases or ask for approval before implementing.
+- Phases should be small, self-contained, and deliver value on their own.
 
 #### Proposed Solution (optional but recommended for complex work)
 - High-level pseudocode, architecture overview, or text diagram if helpful.
@@ -34,6 +35,8 @@ For **non-trivial tasks** use these sections in order. For tiny requests you may
 - Start with: “Implementing the approved plan…”
 - Deliver clean, well-commented, production-ready code in properly tagged blocks.
 - Explain any non-obvious decisions.
+- Keep functions small and focused. If a function grows too large, break it into smaller helpers.
+- Follow modular design principles.
 
 #### Verification
 - Explain exactly how to test/validate the changes.

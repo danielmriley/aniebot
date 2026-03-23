@@ -110,20 +110,6 @@ impl CoreMemory {
         )
     }
 
-    /// Format active interests for injection into the heartbeat system prompt.
-    pub fn interests_block(&self) -> String {
-        if self.interests.is_empty() {
-            return "(none)".to_string();
-        }
-        self.interests
-            .iter()
-            .map(|i| {
-                let cron = i.check_cron.as_deref().unwrap_or("global heartbeat");
-                format!("- {} [id: {}]: {} (check: {})", i.topic, i.id, i.description, cron)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 }
 
 // ---------------------------------------------------------------------------

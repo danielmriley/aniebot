@@ -25,6 +25,9 @@ pub struct Config {
     pub session_gap_hours: u64,
     pub session_summary_min_messages: usize,
     pub history_max_stored: usize,
+    /// Maximum number of interests shown per heartbeat prompt (oldest-unseen first).
+    /// Prevents runaway multi-call floods when many interests are registered.
+    pub heartbeat_max_interests: usize,
 }
 
 impl Config {
@@ -106,6 +109,11 @@ impl Config {
             .parse::<usize>()
             .context("HISTORY_MAX_STORED must be a valid integer")?;
 
+        let heartbeat_max_interests = std::env::var("HEARTBEAT_MAX_INTERESTS")
+            .unwrap_or_else(|_| "8".into())
+            .parse::<usize>()
+            .context("HEARTBEAT_MAX_INTERESTS must be a valid integer")?;
+
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
             .parse::<u64>()
@@ -133,6 +141,7 @@ impl Config {
             session_gap_hours,
             session_summary_min_messages,
             history_max_stored,
+            heartbeat_max_interests,
         })
     }
 }

@@ -360,7 +360,7 @@ fn tool_add_interest() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "add_interest",
-            "description": "Register a topic you want to proactively track and receive updates about. The bot will check in on this interest automatically according to the cron schedule (or during every heartbeat if no cron is given).",
+            "description": "Register a topic the user explicitly asked you to track. Only call this when the user directly names a topic they want monitored — never speculatively for related or inferred topics. The bot will check in automatically per cron schedule (or every heartbeat if no cron is given).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -522,8 +522,6 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_update_core_memory(false),
         tool_remember(),
         tool_recall(),
-        tool_add_interest(),
-        tool_retire_interest(),
         tool_list_interests(),
         tool_forget(),
         tool_set_task(),
@@ -532,6 +530,18 @@ pub fn tool_definitions() -> serde_json::Value {
         tool_add_agenda_item(),
         tool_list_agenda_items(),
         tool_cancel_agenda_item(),
+    ])
+}
+
+/// Tool definitions for the post-conversation interest eval pass.
+/// Mirrors run_memory_eval: restricted set so the LLM can only register,
+/// retire, list, or declare nothing — no other side-effects possible.
+pub fn interest_eval_tools() -> serde_json::Value {
+    json!([
+        tool_add_interest(),
+        tool_retire_interest(),
+        tool_list_interests(),
+        tool_nothing("The conversation contained no explicit interest tracking request from the user."),
     ])
 }
 
@@ -741,6 +751,9 @@ pub async fn dispatch_tool_call(
                 }
             };
 
+            if let Err(e) = validate_cron_fields(cron_local) {
+                return Ok(e);
+            }
             let cron = cron_local_to_utc(cron_local);
             if cron != cron_local {
                 tracing::info!("Cron converted local→UTC: {} → {}", cron_local, cron);
@@ -940,6 +953,9 @@ pub async fn dispatch_tool_call(
                             ));
                         }
                     };
+                    if let Err(e) = validate_cron_fields(&promoted) {
+                        return Ok(e);
+                    }
                     let utc = cron_local_to_utc(&promoted);
                     Some(utc)
                 }
@@ -1045,6 +1061,34 @@ pub async fn dispatch_tool_call(
     }
 }
 
+/// Validates that plain numeric cron fields are within their valid ranges.
+/// Only checks fields that parse as plain integers; wildcards, ranges, and steps are skipped.
+/// Returns `Err(String)` with a user-facing message if a field is out of range.
+/// Expects a 6-field Quartz cron string (SEC MIN HRS DOM MON DOW).
+fn validate_cron_fields(cron_6field: &str) -> Result<(), String> {
+    let parts: Vec<&str> = cron_6field.split_whitespace().collect();
+    // parts[1] = MIN, parts[2] = HRS (Quartz 6-field: SEC MIN HRS DOM MON DOW)
+    if let Ok(h) = parts[2].parse::<i32>() {
+        if !(0..=23).contains(&h) {
+            return Err(format!(
+                "❌ Invalid cron: hours field is `{}` but must be 0–23. \
+                 Please correct the cron expression.",
+                h
+            ));
+        }
+    }
+    if let Ok(m) = parts[1].parse::<i32>() {
+        if !(0..=59).contains(&m) {
+            return Err(format!(
+                "❌ Invalid cron: minutes field is `{}` but must be 0–59. \
+                 Please correct the cron expression.",
+                m
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Advance a simple DOW field by `delta` days (typically ±1 from a midnight rollover).
 /// Returns `None` if the field is a complex expression (`*`, ranges, steps, lists) —
 /// the caller should leave it unchanged in that case.
@@ -1121,7 +1165,19 @@ fn cron_local_to_utc_with_offset(cron: &str, offset_mins: i32) -> String {
 
     let day_delta = total_utc_mins.div_euclid(24 * 60);
     let dow = if day_delta != 0 {
-        advance_dow(parts[5], day_delta).unwrap_or_else(|| parts[5].to_string())
+        match advance_dow(parts[5], day_delta) {
+            Some(d) => d,
+            None => {
+                tracing::warn!(
+                    "cron_local_to_utc: DOW field `{}` is a range/complex expression and \
+                     cannot be auto-adjusted for a day-boundary crossing (day_delta={}). \
+                     The schedule will fire at the correct UTC time but on the original DOW days. \
+                     Manually adjust the DOW field if needed.",
+                    parts[5], day_delta
+                );
+                parts[5].to_string()
+            }
+        }
     } else {
         parts[5].to_string()
     };

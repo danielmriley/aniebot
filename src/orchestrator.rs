@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -15,6 +15,21 @@ use crate::tools;
 
 const HISTORY_WINDOW: usize = 6;
 const MEMORY_ENTRIES: usize = 5;
+
+// ---------------------------------------------------------------------------
+// Background loop concurrency guard
+// ---------------------------------------------------------------------------
+// Only one background loop (heartbeat, interest-check, consolidation) runs at a
+// time.  Overlapping runs corrupt core_memory.json via last-write-wins races and
+// cause multi-hour sequential delegate_cli floods (Bug 8).
+//
+// Uses the same OnceLock<Mutex<()>> pattern as cli_wrapper.rs CLI_LOCK.
+
+static BACKGROUND_GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn background_guard() -> &'static tokio::sync::Mutex<()> {
+    BACKGROUND_GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 // ---------------------------------------------------------------------------
 // LM Studio API types
@@ -275,7 +290,7 @@ async fn try_process(
             })
     };
 
-    // Memory eval pass — awaited so we can gate store_interaction on the result.
+    // Memory eval + interest eval — run concurrently (write to different memory sections).
     // Uses BACKGROUND_LM_MODEL if configured to keep on-path latency low.
     let eval_notable = {
         let eval_model = config.background_lm_model
@@ -283,7 +298,14 @@ async fn try_process(
             .unwrap_or(&config.model_name)
             .to_string();
         let eval_config = Arc::new(Config { model_name: eval_model, ..(*config).clone() });
-        match run_memory_eval(eval_config, user_input.to_string(), reply.clone()).await {
+        let (memory_result, _interest_result) = tokio::join!(
+            run_memory_eval(eval_config.clone(), user_input.to_string(), reply.clone()),
+            run_interest_eval(eval_config, bot.clone(), scheduler.clone(), user_input.to_string(), reply.clone()),
+        );
+        if let Err(e) = _interest_result {
+            tracing::warn!("Interest eval pass failed: {e}");
+        }
+        match memory_result {
             Ok(notable) => notable,
             Err(e) => {
                 tracing::warn!("Memory eval pass failed: {e}");
@@ -465,7 +487,7 @@ fn build_system_prompt(
     };
 
     format!(
-        "{core_block}\n\nCurrent UTC time: {now_utc}{elapsed_str}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nYour '## Current Beliefs' are hard-won conclusions from your experience — bring them into conversation naturally when they're relevant.\n\nThe conversation history is for context only — do not repeat or continue tool calls from previous turns. Only act on the most recent user message.\n\nHow to respond:\n- For conversational messages, greetings, reactions, opinions, or anything requiring no external data — call reply_to_user directly.\n- For tasks requiring research or multiple tool calls — use tools first. Use send_update for progress messages while working. Then either call reply_to_user with your findings, or call reflect(done=true) to have a polished reply synthesized automatically from all your work (optionally provide a reply hint in the reflect call).\n- If the user references a past event, something from a previous session, or asks what you've discussed before — call recall() with relevant keywords before answering. Your episodic memory stores specific moments, discoveries, and events across all sessions.{gap_instruction}{session_section}\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
+        "{core_block}\n\nCurrent UTC time: {now_utc}{elapsed_str}\n\nYou have genuine opinions and personality — engage freely and directly with conversational messages. Never refuse to share your thoughts or react to something.\n\nYour '## Current Beliefs' are hard-won conclusions from your experience — bring them into conversation naturally when they're relevant.\n\nThe conversation history is for context only — do not repeat or continue tool calls from previous turns. Only act on the most recent user message.\n\nHow to respond:\n- For conversational messages, greetings, reactions, opinions, or anything requiring no external data — call reply_to_user directly.\n- For tasks requiring research or multiple tool calls — use tools first. Use send_update for progress messages while working. Then either call reply_to_user with your findings, or call reflect(done=true) to have a polished reply synthesized automatically from all your work (optionally provide a reply hint in the reflect call).\n- If the user references a past event, something from a previous session, or asks what you've discussed before — call recall() with relevant keywords before answering. Your episodic memory stores specific moments, discoveries, and events across all sessions.\n- When the user asks you to track a topic, acknowledge it naturally in your reply. Interest registration is handled automatically after the conversation — you do not need to call any tool for it.{gap_instruction}{session_section}\n\n## Recent Memory\n{memory_bullets}{episodic_section}{agenda_section}",
         core_block = core.to_prompt_block(),
         now_utc = now_utc,
         elapsed_str = elapsed_str,
@@ -558,6 +580,16 @@ async fn try_run_heartbeat(
     bot: Bot,
     scheduler: Arc<SchedulerHandle>,
 ) -> anyhow::Result<()> {
+    // Prevent concurrent background loops — last-write-wins races on core_memory.json
+    // and sequential delegate_cli floods caused multi-hour overlapping heartbeat runs.
+    let _guard = match background_guard().try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::info!("Heartbeat skipped: another background loop is already running");
+            return Ok(());
+        }
+    };
+
     let (core, all_recent, pending_agenda) = tokio::join!(
         crate::core_memory::load(),
         crate::episodic::load_recent(50),
@@ -602,23 +634,25 @@ async fn try_run_heartbeat(
         .cloned()
         .collect();
 
-    let system_prompt = build_heartbeat_system_prompt(&core, &all_recent, &recent_sends, &recent_checks, &pending_agenda);
+    let system_prompt = build_heartbeat_system_prompt(&core, &all_recent, &recent_sends, &recent_checks, &pending_agenda, config.heartbeat_max_interests);
     let messages = vec![
         LmMessage { role: "system".into(), content: Some(system_prompt), tool_calls: None, tool_call_id: None },
         LmMessage { role: "user".into(), content: Some("Heartbeat check. Review your interests and recent observations. If there is something worth sharing, send a message. Otherwise, stay silent.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    let max_iters = config.max_iters_heartbeat;
-    let (sent, _) = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
-
-    // Always write a heartbeat-checked entry with topics covered, so the next heartbeat cycle
-    // can skip re-researching interests that were already checked and found nothing new.
+    // Write the heartbeat-checked entry BEFORE running the loop.
+    // This makes the topics visible in the "Recently Checked" context window immediately,
+    // so any concurrent check (if the guard were absent) would skip them, and the next
+    // heartbeat accurately sees these topics as in-flight.
+    // We record the capped set (what the LLM actually sees) sorted oldest-unseen first.
     {
-        let interest_topics = core.interests.iter().map(|i| i.topic.as_str()).collect::<Vec<_>>().join(", ");
-        let content = if interest_topics.is_empty() {
-            "[heartbeat checked] No active interests.".to_string()
+        let mut sorted: Vec<&crate::core_memory::Interest> = core.interests.iter().collect();
+        sorted.sort_by(|a, b| a.last_seen_date.cmp(&b.last_seen_date));
+        let topics: Vec<&str> = sorted.iter().take(config.heartbeat_max_interests).map(|i| i.topic.as_str()).collect();
+        let content = if topics.is_empty() {
+            "[heartbeat checking] No active interests.".to_string()
         } else {
-            format!("[heartbeat checked] Topics checked: {interest_topics}")
+            format!("[heartbeat checking] Topics: {}", topics.join(", "))
         };
         let entry = crate::episodic::EpisodicEntry {
             id: uuid::Uuid::new_v4().to_string(),
@@ -631,10 +665,18 @@ async fn try_run_heartbeat(
         let _ = crate::episodic::append(&entry).await;
     }
 
+    let max_iters = config.max_iters_heartbeat;
+    let (sent, _) = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
+
     // Auto-log whatever was sent so the next heartbeat can see it and avoid repeating.
     // Include the interest topics covered so the next cycle can match by name, not prose.
     if let Some(text) = sent {
-        let interest_topics = core.interests.iter().map(|i| i.topic.as_str()).collect::<Vec<_>>().join(", ");
+        let mut sorted: Vec<&crate::core_memory::Interest> = core.interests.iter().collect();
+        sorted.sort_by(|a, b| a.last_seen_date.cmp(&b.last_seen_date));
+        let interest_topics = sorted.iter()
+            .map(|i| i.topic.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let summary = text.chars().take(150).collect::<String>();
         let content = if interest_topics.is_empty() {
             format!("[heartbeat sent] {summary}")
@@ -673,6 +715,14 @@ async fn try_run_interest_check(
     scheduler: Arc<SchedulerHandle>,
     interest_id: String,
 ) -> anyhow::Result<()> {
+    let _guard = match background_guard().try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::info!("Interest check skipped (id={}): another background loop is running", interest_id);
+            return Ok(());
+        }
+    };
+
     let core = crate::core_memory::load().await?;
     let Some(interest) = core.interests.iter().find(|i| i.id == interest_id).cloned() else {
         tracing::info!("Interest {interest_id} not found (may have been retired) — skipping check");
@@ -716,6 +766,14 @@ async fn try_run_consolidation(
     bot: Bot,
     scheduler: Arc<SchedulerHandle>,
 ) -> anyhow::Result<()> {
+    let _guard = match background_guard().try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::info!("Consolidation skipped: another background loop is running");
+            return Ok(());
+        }
+    };
+
     tracing::info!("Consolidation pass starting");
 
     let (core, entries) = tokio::join!(
@@ -822,6 +880,7 @@ fn build_heartbeat_system_prompt(
     recent_sends: &[crate::episodic::EpisodicEntry],
     recent_checks: &[crate::episodic::EpisodicEntry],
     pending_agenda: &[crate::agenda::AgendaItem],
+    max_interests: usize,
 ) -> String {
     let notable: Vec<String> = all_entries
         .iter()
@@ -882,7 +941,30 @@ You are in heartbeat mode. Follow these steps in order:\n\
 3. If your curiosity queue has items, pick ONE and investigate it with delegate_cli. If fully resolved, remove it with update_core_memory(\"curiosity_queue\", ...).\n\
 4. After completing any series of searches or tool calls, call reflect to record what you found and decide whether to continue. Only call reply_to_user if you found something genuinely new or useful. Default to nothing — silence is the right choice when nothing significant has changed.",
         core_block = core.to_prompt_block(),
-        interests = core.interests_block(),
+        interests = {
+            // Show at most `max_interests` interests, sorted oldest-unseen first.
+            // This prevents the heartbeat from trying to check 60+ interests in one turn.
+            let total = core.interests.len();
+            if total == 0 {
+                "(none)".to_string()
+            } else {
+                let mut sorted: Vec<&crate::core_memory::Interest> = core.interests.iter().collect();
+                sorted.sort_by(|a, b| a.last_seen_date.cmp(&b.last_seen_date));
+                let shown = sorted.iter().take(max_interests);
+                let lines: Vec<String> = shown.map(|i| {
+                    let cron = i.check_cron.as_deref().unwrap_or("global heartbeat");
+                    format!("- {} [id: {}]: {} (check: {})", i.topic, i.id, i.description, cron)
+                }).collect();
+                let mut block = lines.join("\n");
+                if total > max_interests {
+                    block.push_str(&format!(
+                        "\n*(showing {} of {} interests — oldest-unseen first)*",
+                        max_interests, total
+                    ));
+                }
+                block
+            }
+        },
         episodic_section = episodic_section,
         sends_section = sends_section,
         checks_section = checks_section,
@@ -944,6 +1026,13 @@ async fn run_agentic_loop(
     // This catches alternating loops (A-B-A-B) as well as consecutive repeats (A-A).
     let mut seen_fingerprints: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     let mut anti_stall_injected = false;
+
+    // 1.5D — Per-tool call cap: prevent runaway multi-call floods (e.g. 60× add_interest).
+    // Warning injected at WARN threshold; dispatch suppressed from HARD threshold onward.
+    const TOOL_CALL_WARN_THRESHOLD: usize = 8;
+    const TOOL_CALL_HARD_LIMIT: usize = 15;
+    let mut tool_call_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut tool_call_warning: Option<String> = None;
 
     // 1.5C — Budget exhaustion: warn the model at 80% consumption.
     let mut budget_warning_injected = false;
@@ -1154,6 +1243,55 @@ async fn run_agentic_loop(
                 }
             }
 
+            // 1.5D — Per-tool call cap: warn at WARN threshold, hard-stop at HARD limit.
+            // Terminal tools are excluded — the loop must be able to conclude.
+            let is_terminal = matches!(tool_name.as_str(), "reply_to_user" | "nothing" | "reflect" | "send_update");
+            if !is_terminal {
+                let count = {
+                    let c = tool_call_counts.entry(tool_name.clone()).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                if count == TOOL_CALL_WARN_THRESHOLD {
+                    tool_call_warning = Some(format!(
+                        "[System: You have called `{}` {} times this turn. \
+                         This is unusually many — stop calling this tool unless \
+                         absolutely necessary and wrap up your work.]",
+                        tool_name, count
+                    ));
+                }
+                if count >= TOOL_CALL_HARD_LIMIT {
+                    tracing::warn!(
+                        "Agentic loop iter {}: hard-stopped `{}` after {} calls this turn",
+                        iter + 1, tool_name, count
+                    );
+                    let stop_result = format!(
+                        "❌ Tool call suppressed: `{}` has been called {} times this turn, \
+                         exceeding the per-turn limit of {}. \
+                         Stop calling this tool and wrap up.",
+                        tool_name, count, TOOL_CALL_HARD_LIMIT
+                    );
+                    let now = Utc::now();
+                    messages.push(LmMessage {
+                        role: "assistant".into(), content: None,
+                        tool_calls: single_call_json.clone(), tool_call_id: None,
+                    });
+                    new_messages.push(ConversationMessage {
+                        role: "assistant".into(), content: None,
+                        tool_calls: single_call_json, tool_call_id: None, timestamp: now,
+                    });
+                    messages.push(LmMessage {
+                        role: "tool".into(), content: Some(stop_result.clone()),
+                        tool_calls: None, tool_call_id: Some(call_id.clone()),
+                    });
+                    new_messages.push(ConversationMessage {
+                        role: "tool".into(), content: Some(stop_result),
+                        tool_calls: None, tool_call_id: Some(call_id), timestamp: now,
+                    });
+                    continue;
+                }
+            }
+
             tracing::info!("Agentic loop iter {}: tool={} [LM: {:.1}s]", iter + 1, tool_name, lm_elapsed.as_secs_f32());
 
             let dispatch_start = std::time::Instant::now();
@@ -1308,9 +1446,67 @@ async fn run_agentic_loop(
 
             // Separate terminal calls from non-terminal to ensure non-terminal
             // tools run first (they may produce data that informs the reply).
-            let (terminal_calls, other_calls): (Vec<_>, Vec<_>) = all_tool_calls
+            let (terminal_calls, mut other_calls): (Vec<_>, Vec<_>) = all_tool_calls
                 .into_iter()
                 .partition(|c| matches!(c.function.name.as_str(), "reply_to_user" | "nothing" | "reflect"));
+
+            // Suppressed items: (call_id, tool_name, reason_msg) — get synthetic results below.
+            let mut pre_suppressed: Vec<(String, String, String)> = Vec::new();
+
+            // --- Intra-batch dedup + per-tool call cap for non-terminal tools ---
+            // Deduplicate exact (tool_name, args) pairs within this batch — prevents
+            // a single LLM response containing 50 identical delegate_cli calls from
+            // all being dispatched.  Also enforces the per-turn HARD_LIMIT.
+            {
+                let mut batch_seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                let mut filtered: Vec<_> = Vec::with_capacity(other_calls.len());
+                for call in other_calls {
+                    let key = (call.function.name.clone(), call.function.arguments.clone());
+                    if !batch_seen.insert(key) {
+                        // Duplicate within this batch — record for synthetic result.
+                        pre_suppressed.push((
+                            call.id,
+                            call.function.name,
+                            "⚠️ Duplicate call suppressed — this exact call already appeared \
+                             in this batch.".to_string(),
+                        ));
+                        continue;
+                    }
+                    let count = {
+                        let c = tool_call_counts.entry(call.function.name.clone()).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    if count == TOOL_CALL_WARN_THRESHOLD {
+                        tool_call_warning = Some(format!(
+                            "[System: You have called `{}` {} times this turn. \
+                             This is unusually many — stop calling this tool unless \
+                             absolutely necessary and wrap up your work.]",
+                            call.function.name, count
+                        ));
+                    }
+                    if count >= TOOL_CALL_HARD_LIMIT {
+                        tracing::warn!(
+                            "Agentic loop iter {}: hard-stopped `{}` after {} calls (multi-call)",
+                            iter + 1, call.function.name, count
+                        );
+                        pre_suppressed.push((
+                            call.id,
+                            call.function.name.clone(),
+                            format!(
+                                "❌ Tool call suppressed: `{}` has been called {} times this \
+                                 turn, exceeding the per-turn limit of {}. \
+                                 Stop calling this tool and wrap up.",
+                                call.function.name, count, TOOL_CALL_HARD_LIMIT
+                            ),
+                        ));
+                        continue;
+                    }
+                    filtered.push(call);
+                }
+                other_calls = filtered;
+            }
 
             // Dispatch type alias: (original_index, call_id, tool_name, raw_args, result)
             type DispatchItem = (usize, String, String, serde_json::Value, anyhow::Result<String>);
@@ -1389,8 +1585,16 @@ async fn run_agentic_loop(
                 results.push((base_idx + i, call_id, tool_name, raw_args, r));
             }
 
+            // Append synthetic results for deduplicated/hard-stopped calls.
+            // All original call IDs must appear in the results to keep the
+            // assistant→tool message pairs well-formed.
+            let base_suppressed = results.len();
+            for (i, (call_id, tool_name, reason)) in pre_suppressed.into_iter().enumerate() {
+                results.push((base_suppressed + i, call_id, tool_name, serde_json::Value::Null, Ok(reason)));
+            }
+
             tracing::info!(
-                "Agentic loop iter {}: multi-call ({} tools) [LM: {:.1}s]",
+                "Agentic loop iter {}: multi-call ({} tools dispatched) [LM: {:.1}s]",
                 iter + 1, results.len(), lm_elapsed.as_secs_f32()
             );
 
@@ -1527,6 +1731,17 @@ async fn run_agentic_loop(
             }
             // No terminal tool → loop continues with updated context.
         }
+
+        // 1.5D — Inject per-tool warning into context if threshold was hit this iteration.
+        // This runs after both single-call and multi-call paths (but not after continue/return).
+        if let Some(warn) = tool_call_warning.take() {
+            messages.push(LmMessage {
+                role: "user".into(),
+                content: Some(warn),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
     }
 
     Ok((None, new_messages))
@@ -1662,10 +1877,13 @@ async fn run_memory_eval(
          Update user_profile if the exchange contained ANY of these:\n\
          - User's name, location, job, field, or life stage\n\
          - User's achievements, projects, relationships, or preferences\n\
+         - Projects they are actively building, working on, or excited about\n\
          - Anything that defines who the user is or what matters to them\n\n\
          Update beliefs if you reached a conclusion or formed an opinion during this exchange — \
-         about the world, technology, society, or this user's situation. Be direct: record the belief \
-         as a concise first-person statement (e.g. \"Async Rust is worth the complexity for long-lived services\").\n\n\
+         about the world, technology, society, or this user's situation. Also update beliefs when \
+         the user expresses a strong opinion about technology, AI, or design — these are distinct \
+         from factual profile info. Be direct: record the belief as a concise first-person statement \
+         (e.g. \"Async Rust is worth the complexity for long-lived services\").\n\n\
          Update curiosity_queue if something came up that you genuinely want to investigate or learn more about — \
          an unresolved question, an interesting topic, something the user mentioned that you'd like to follow up on. \
          Add the full existing list plus the new item as a JSON array.\n\n\
@@ -1718,6 +1936,96 @@ async fn run_memory_eval(
     }
 
     Ok(call.function.name == "update_core_memory")
+}
+
+/// Post-conversation interest eval pass.
+///
+/// Runs after the main agentic loop with a restricted tool set so the LLM can
+/// only add/retire/list interests or call nothing — no other side-effects.
+/// Mirrors `run_memory_eval` structurally: same background-model swap, same
+/// constrained single-pass design.
+///
+/// This is the structural fix for Bug 1: by removing `add_interest` from the
+/// conversational `tool_definitions()` set, runaway in-loop floods are impossible.
+/// Interest registration is gated here on explicit user intent instead.
+async fn run_interest_eval(
+    config: Arc<Config>,
+    bot: Bot,
+    scheduler: Arc<SchedulerHandle>,
+    user_msg: String,
+    assistant_reply: String,
+) -> anyhow::Result<bool> {
+    // Load current interests so the model can see what is already tracked and
+    // look up IDs before retiring.
+    let current = crate::core_memory::load().await?;
+
+    let interests_block = if current.interests.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        current.interests.iter()
+            .map(|i| {
+                let cron = i.check_cron.as_deref().unwrap_or("global heartbeat");
+                format!("- {} [id: {}]: {} (check: {})", i.topic, i.id, i.description, cron)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let system_msg = format!(
+        "You are managing the interest tracking list for AnieBot, a personal AI assistant.\n\n\
+         ## Currently tracked interests\n\
+         {interests_block}\n\n\
+         ## Your task\n\
+         Review the exchange below. Did the user explicitly ask to track or stop tracking any topics?\n\n\
+         - Call `add_interest` ONLY for topics the user directly named and asked you to monitor. \
+           If the user listed N topics by name, register exactly those N — nothing else. \
+           You may include a `check_cron` if the user specified a schedule.\n\
+         - Call `retire_interest` if the user asked to stop tracking an existing topic. \
+           Call `list_interests` first if you need to look up an interest ID.\n\
+         - Call `nothing` if the user made no explicit tracking request.\n\n\
+         Do NOT register topics you infer, extrapolate, or consider related. Only act on what \
+         the user directly said.",
+        interests_block = interests_block,
+    );
+
+    let exchange = format!("User: {user_msg}\nAssistant: {assistant_reply}");
+
+    let messages = vec![
+        LmMessage { role: "system".into(), content: Some(system_msg), tool_calls: None, tool_call_id: None },
+        LmMessage { role: "user".into(), content: Some(exchange), tool_calls: None, tool_call_id: None },
+    ];
+
+    // Use background model if configured — same swap as run_memory_eval.
+    let eval_model = config.background_lm_model
+        .as_deref()
+        .unwrap_or(&config.model_name)
+        .to_string();
+    let eval_config = Arc::new(Config { model_name: eval_model, ..(*config).clone() });
+
+    let (_, new_msgs) = run_agentic_loop(
+        eval_config,
+        bot,
+        scheduler,
+        messages,
+        tools::interest_eval_tools(),
+        5,      // max_iters: enough for a handful of registrations
+        false,  // send_reply: don't push Telegram messages from this pass
+    ).await?;
+
+    // Return true if any interest was added or retired (useful for logging).
+    let changed = new_msgs.iter().any(|m| {
+        m.tool_calls
+            .as_ref()
+            .and_then(|tc| tc.as_array())
+            .map(|arr| arr.iter().any(|c| {
+                let name = c["function"]["name"].as_str().unwrap_or("");
+                name == "add_interest" || name == "retire_interest"
+            }))
+            .unwrap_or(false)
+    });
+
+    tracing::info!("Interest eval complete — changed={changed}");
+    Ok(changed)
 }
 
 // ---------------------------------------------------------------------------
