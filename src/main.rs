@@ -15,7 +15,6 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 mod agent_session;
 mod agenda;
 mod bot;
-mod cli_wrapper;
 mod config;
 mod core_memory;
 mod episodic;

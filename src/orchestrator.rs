@@ -110,7 +110,7 @@ async fn try_process(
     )?;
 
     // Build windowed history slice.
-    // Exchanges now take 2 messages (reply_to_user) or 3 (tool call + result),
+    // Exchanges now take 2 messages (final_reply) or 3 (tool call + result),
     // so use * 3 as an upper bound to avoid slicing mid-exchange.
     let window_start = history.len().saturating_sub(HISTORY_WINDOW * 3);
     let history_window = &history[window_start..];
@@ -196,16 +196,16 @@ async fn try_process(
         bot.clone(),
         scheduler.clone(),
         messages,
-        tools::tool_definitions(),
+        tools::tools_for_context(tools::ToolContext::User),
         max_iters,
         false,
     ).await?;
 
     // Phase 2 — direct reply or synthesis.
-    // reply_to_user exit → Some(text): send directly, skip synthesis (fast path).
+    // final_reply exit → Some(text): send directly, skip synthesis (fast path).
     // reflect(done=true) / exhausted → None: synthesize from accumulated tool results.
     let reply = if let Some(direct) = reply_opt {
-        tracing::info!("Conversation: direct reply path (reply_to_user)");
+        tracing::info!("Conversation: direct reply path (final_reply)");
         direct
     } else {
         let tool_results_text: String = assistant_turns
@@ -590,7 +590,7 @@ async fn try_run_heartbeat(
     }
 
     let max_iters = config.max_iters_heartbeat;
-    let (sent, _) = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
+    let (sent, _) = run_agentic_loop(config, bot, scheduler, messages, tools::tools_for_context(tools::ToolContext::Heartbeat), max_iters, true).await?;
 
     // Auto-log whatever was sent so the next heartbeat can see it and avoid repeating.
     // Include the interest topics covered so the next cycle can match by name, not prose.
@@ -665,7 +665,7 @@ async fn try_run_interest_check(
     ];
 
     let max_iters = config.max_iters_agenda;
-    let _ = run_agentic_loop(config, bot, scheduler, messages, tools::heartbeat_tool_definitions(), max_iters, true).await?;
+    let _ = run_agentic_loop(config, bot, scheduler, messages, tools::tools_for_context(tools::ToolContext::Heartbeat), max_iters, true).await?;
     Ok(())
 }
 
@@ -749,7 +749,7 @@ You are in consolidation mode. Make a single, complete pass through these observ
 3. Any observations worth preserving permanently? → remember(content, tags, 5)\n\
 4. Did any unresolved questions or interesting topics come up worth investigating later? → update_core_memory(\"curiosity_queue\", ...) [JSON array of short topic strings, e.g. \"[\\\"How does Lean 4 compare to Coq for software verification?\\\"]\"]. Add to existing items, don't replace them.\n\
 5. Any interests to add or retire? → add_interest / retire_interest{identity_question}\n\
-\nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call nothing to end the consolidation. Do not call nothing before you have considered all the questions above.",
+\nIMPORTANT: Make ALL your updates now in this one pass. Be conservative — only update if something is genuinely new. Once you have made all your updates (or if nothing warrants updating), you MUST call reflect(done=true) to end the consolidation. Do not call reflect(done=true) before you have considered all the questions above.",
         core_block = core.to_prompt_block(),
         episodic_block = episodic_block,
         high_sig_section = high_sig_section,
@@ -761,7 +761,7 @@ You are in consolidation mode. Make a single, complete pass through these observ
         LmMessage { role: "user".into(), content: Some("Consolidation cycle. Reflect and update as needed.".into()), tool_calls: None, tool_call_id: None },
     ];
 
-    let _ = run_agentic_loop(config.clone(), bot, scheduler, messages, tools::consolidation_tool_definitions(), config.max_iters_consolidation, true).await?; // return value ignored for consolidation
+    let _ = run_agentic_loop(config.clone(), bot, scheduler, messages, tools::tools_for_context(tools::ToolContext::Consolidation), config.max_iters_consolidation, true).await?; // return value ignored for consolidation
 
     // Reload core memory after LM pass (model may have added/retired interests).
     // Apply health decay: -10 per consolidation pass for each interest whose topic
@@ -860,10 +860,10 @@ fn build_heartbeat_system_prompt(
         "{core_block}\n\n## Active Interests\n{interests}{episodic_section}{sends_section}{checks_section}{agenda_section}\n\n\
 You are in heartbeat mode. Follow these steps in order:\n\
 0. Check '## Pending Tasks' above. Work through any Pending items — use tools as needed, then call complete_agenda_item when done. Cancel with cancel_agenda_item if no longer relevant. Skip items already In Progress or Done.\n\
-1. Review '## Recently Sent to You' and '## Recently Checked' above. Any interest whose topic appears in either list was already covered within the last 6 hours — SKIP delegate_cli for it entirely. Do not re-research it.\n\
-2. For interests NOT recently covered or checked, use delegate_cli to check for new or noteworthy developments.\n\
-3. If your curiosity queue has items, pick ONE and investigate it with delegate_cli. If fully resolved, remove it with update_core_memory(\"curiosity_queue\", ...).\n\
-4. After completing any series of searches or tool calls, call reflect to record what you found and decide whether to continue. Only call reply_to_user if you found something genuinely new or useful. Default to nothing — silence is the right choice when nothing significant has changed.",
+1. Review '## Recently Sent to You' and '## Recently Checked' above. Any interest whose topic appears in either list was already covered within the last 6 hours — skip researching it entirely. Do not re-research it.\n\
+2. For interests NOT recently covered or checked, use fetch_page or shell_command to check for new or noteworthy developments.\n\
+3. If your curiosity queue has items, pick ONE and investigate it with fetch_page or shell_command. If fully resolved, remove it with update_core_memory(\"curiosity_queue\", ...).\n\
+4. After completing any series of searches or tool calls, call reflect to record what you found and decide whether to continue. Only call final_reply if you found something genuinely new or useful. Default to reflect(done=true) — silence is the right choice when nothing significant has changed.",
         core_block = core.to_prompt_block(),
         interests = {
             // Show at most `max_interests` interests, sorted oldest-unseen first.
@@ -1015,9 +1015,16 @@ async fn run_memory_eval(
         {
             "type": "function",
             "function": {
-                "name": "nothing",
-                "description": "Use only when the exchange contained no new facts about the user and no new opinions or beliefs worth recording.",
-                "parameters": { "type": "object", "properties": {} }
+                "name": "reflect",
+                "description": "Use reflect(done=true) when the exchange contained no new facts about the user and no new opinions or beliefs worth recording.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "observation": { "type": "string" },
+                        "done": { "type": "boolean" }
+                    },
+                    "required": ["observation", "done"]
+                }
             }
         }
     ]);
@@ -1059,7 +1066,7 @@ async fn run_memory_eval(
          Update curiosity_queue if something came up that you genuinely want to investigate or learn more about — \
          an unresolved question, an interesting topic, something the user mentioned that you'd like to follow up on. \
          Add the full existing list plus the new item as a JSON array.\n\n\
-         Call `nothing` only for pure small talk, acknowledgements, or follow-ups \
+         Call `reflect(done=true)` only for pure small talk, acknowledgements, or follow-ups \
          that add no new facts (e.g. \"thanks\", \"got it\", \"that makes sense\").\n\n\
          When updating user_profile, write a concise prose summary that PRESERVES \
          existing facts and adds the new ones — do not discard what is already known.",
@@ -1113,7 +1120,7 @@ async fn run_memory_eval(
 /// Post-conversation interest eval pass.
 ///
 /// Runs after the main agentic loop with a restricted tool set so the LLM can
-/// only add/retire/list interests or call nothing — no other side-effects.
+/// only add/retire/list interests or call reflect(done=true) — no other side-effects.
 /// Mirrors `run_memory_eval` structurally: same background-model swap, same
 /// constrained single-pass design.
 ///
@@ -1154,7 +1161,7 @@ async fn run_interest_eval(
            You may include a `check_cron` if the user specified a schedule.\n\
          - Call `retire_interest` if the user asked to stop tracking an existing topic. \
            Call `list_interests` first if you need to look up an interest ID.\n\
-         - Call `nothing` if the user made no explicit tracking request.\n\n\
+         - Call `reflect(done=true)` if the user made no explicit tracking request.\n\n\
          Do NOT register topics you infer, extrapolate, or consider related. Only act on what \
          the user directly said.",
         interests_block = interests_block,
@@ -1179,7 +1186,7 @@ async fn run_interest_eval(
         bot,
         scheduler,
         messages,
-        tools::interest_eval_tools(),
+        tools::tools_for_context(tools::ToolContext::InterestEval),
         5,      // max_iters: enough for a handful of registrations
         false,  // send_reply: don't push Telegram messages from this pass
     ).await?;

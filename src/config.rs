@@ -9,12 +9,9 @@ pub struct Config {
     pub model_name: String,
     pub allowed_user_id: u64,
     pub workspace_dir: PathBuf,
-    pub cli_timeout_secs: u64,
     pub morning_summary_cron: String,
     pub health_check_interval_mins: u64,
-    pub copilot_model: Option<String>,
     pub heartbeat_cron: String,
-    pub background_copilot_model: Option<String>,
     pub consolidation_threshold: usize,
     pub max_iters_conversation: usize,
     pub max_iters_heartbeat: usize,
@@ -28,6 +25,9 @@ pub struct Config {
     /// Maximum number of interests shown per heartbeat prompt (oldest-unseen first).
     /// Prevents runaway multi-call floods when many interests are registered.
     pub heartbeat_max_interests: usize,
+    /// Default timeout in seconds for shell_command calls. Can be overridden per-call
+    /// up to a maximum of 600 seconds.
+    pub shell_command_timeout_secs: u64,
 }
 
 impl Config {
@@ -50,18 +50,11 @@ impl Config {
             std::env::var("WORKSPACE_DIR").unwrap_or_else(|_| "./workspace".into()),
         );
 
-        let cli_timeout_secs = std::env::var("CLI_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "120".into())
-            .parse::<u64>()
-            .context("CLI_TIMEOUT_SECS must be a valid integer")?;
-
         let morning_summary_cron = std::env::var("MORNING_SUMMARY_CRON")
             .unwrap_or_else(|_| "0 0 8 * * *".into());
 
-        let copilot_model = std::env::var("COPILOT_MODEL").ok();
         let heartbeat_cron = std::env::var("HEARTBEAT_CRON")
             .unwrap_or_else(|_| "0 0 * * * *".into());
-        let background_copilot_model = std::env::var("BACKGROUND_COPILOT_MODEL").ok();
         let consolidation_threshold = std::env::var("CONSOLIDATION_THRESHOLD")
             .unwrap_or_else(|_| "15".into())
             .parse::<usize>()
@@ -114,6 +107,11 @@ impl Config {
             .parse::<usize>()
             .context("HEARTBEAT_MAX_INTERESTS must be a valid integer")?;
 
+        let shell_command_timeout_secs = std::env::var("SHELL_COMMAND_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "30".into())
+            .parse::<u64>()
+            .context("SHELL_COMMAND_TIMEOUT_SECS must be a valid integer")?;
+
         let health_check_interval_mins = std::env::var("HEALTH_CHECK_INTERVAL_MINS")
             .unwrap_or_else(|_| "30".into())
             .parse::<u64>()
@@ -125,12 +123,9 @@ impl Config {
             model_name,
             allowed_user_id,
             workspace_dir,
-            cli_timeout_secs,
             morning_summary_cron,
             health_check_interval_mins,
-            copilot_model,
             heartbeat_cron,
-            background_copilot_model,
             consolidation_threshold,
             max_iters_conversation,
             max_iters_heartbeat,
@@ -142,6 +137,7 @@ impl Config {
             session_summary_min_messages,
             history_max_stored,
             heartbeat_max_interests,
+            shell_command_timeout_secs,
         })
     }
 }

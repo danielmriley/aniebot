@@ -1,18 +1,75 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use teloxide::prelude::*;
 use uuid::Uuid;
 
-use crate::cli_wrapper;
 use crate::config::Config;
 use crate::core_memory;
 use crate::episodic;
 use crate::schedule_store::{self, ScheduleEntry};
 use crate::scheduler::{self, SchedulerHandle};
+
+// ---------------------------------------------------------------------------
+// Tool metadata — used by AgentSession for parallelism decisions
+// ---------------------------------------------------------------------------
+
+pub struct ToolDef {
+    pub name: &'static str,
+    pub parallel_safe: bool,
+}
+
+pub const ALL_TOOL_METADATA: &[ToolDef] = &[
+    ToolDef { name: "send_update",          parallel_safe: false },
+    ToolDef { name: "final_reply",          parallel_safe: false },
+    ToolDef { name: "reflect",              parallel_safe: false },
+    ToolDef { name: "read_file",            parallel_safe: true  },
+    ToolDef { name: "write_file",           parallel_safe: false },
+    ToolDef { name: "edit_file",            parallel_safe: false },
+    ToolDef { name: "shell_command",        parallel_safe: false },
+    ToolDef { name: "list_dir",             parallel_safe: true  },
+    ToolDef { name: "fetch_page",           parallel_safe: true  },
+    ToolDef { name: "schedule_task",        parallel_safe: false },
+    ToolDef { name: "list_schedules",       parallel_safe: true  },
+    ToolDef { name: "delete_schedule",      parallel_safe: false },
+    ToolDef { name: "update_schedule",      parallel_safe: false },
+    ToolDef { name: "schedule_once",        parallel_safe: false },
+    ToolDef { name: "update_core_memory",   parallel_safe: false },
+    ToolDef { name: "read_core_memory",     parallel_safe: true  },
+    ToolDef { name: "remember",             parallel_safe: false },
+    ToolDef { name: "recall",               parallel_safe: true  },
+    ToolDef { name: "forget",               parallel_safe: false },
+    ToolDef { name: "list_episodic_recent", parallel_safe: true  },
+    ToolDef { name: "add_interest",         parallel_safe: false },
+    ToolDef { name: "retire_interest",      parallel_safe: false },
+    ToolDef { name: "list_interests",       parallel_safe: true  },
+    ToolDef { name: "set_task",             parallel_safe: false },
+    ToolDef { name: "add_agenda_item",      parallel_safe: false },
+    ToolDef { name: "list_agenda_items",    parallel_safe: true  },
+    ToolDef { name: "update_agenda_item",   parallel_safe: false },
+    ToolDef { name: "cancel_agenda_item",   parallel_safe: false },
+    ToolDef { name: "complete_agenda_item", parallel_safe: false },
+    ToolDef { name: "get_current_time",     parallel_safe: true  },
+];
+
+pub fn is_parallel_safe(name: &str) -> bool {
+    ALL_TOOL_METADATA.iter().any(|t| t.name == name && t.parallel_safe)
+}
+
+// ---------------------------------------------------------------------------
+// Tool context — determines which tools are available in each execution mode
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum ToolContext {
+    User,
+    Heartbeat,
+    InterestEval,
+    Consolidation,
+}
 
 // ---------------------------------------------------------------------------
 // LM tool call types (shared with orchestrator)
@@ -38,41 +95,116 @@ pub struct LmFunctionCall {
 }
 
 // ---------------------------------------------------------------------------
-// Tool helpers — one function per tool; composed into the three public sets below
+// Tool helpers — one function per tool; composed into context sets below
 // ---------------------------------------------------------------------------
 
-fn tool_delegate_cli() -> serde_json::Value {
+fn tool_read_file() -> serde_json::Value {
     json!({
         "type": "function",
         "function": {
-            "name": "delegate_cli",
-            "description": "Execute a task using copilot, which has full filesystem access, internet access, and can run shell commands. Use this for: fetching news, weather, stock prices, or any real-time data; reading or writing files; running shell commands; web searches; anything requiring information beyond your training data. Do NOT use this for reactions, thank-yous, follow-up comments, or opinion questions about information you already provided — use reply_to_user for those.",
+            "name": "read_file",
+            "description": "Read the contents of a file. Returns up to `limit` lines starting from `offset`. Omit both to read the whole file.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "Precise, self-contained task description for copilot. Include all context needed."
-                    }
+                    "path": { "type": "string", "description": "Absolute or relative path to the file." },
+                    "offset": { "type": "integer", "description": "Line number to start reading from (1-based, optional)." },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return (optional)." }
                 },
-                "required": ["task"]
+                "required": ["path"]
             }
         }
     })
 }
 
-fn tool_fetch_url() -> serde_json::Value {
+fn tool_write_file() -> serde_json::Value {
     json!({
         "type": "function",
         "function": {
-            "name": "fetch_url",
-            "description": "Fetch the raw contents of a URL via HTTP GET. Use for reading web pages, REST APIs, or any public HTTP resource. Returns up to 8 KB of the response body as text. Prefer this over delegate_cli for simple, unauthenticated GET requests.",
+            "name": "write_file",
+            "description": "Write content to a file, creating it or overwriting it entirely.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {
+                    "path": { "type": "string", "description": "Absolute or relative path to the file." },
+                    "content": { "type": "string", "description": "Content to write." }
+                },
+                "required": ["path", "content"]
+            }
+        }
+    })
+}
+
+fn tool_edit_file() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Make a targeted edit to a file by replacing an exact string. Read the file first to get the exact text to replace. Fails if old_string is not found — use the exact verbatim text as it appears in the file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative path to the file." },
+                    "old_string": { "type": "string", "description": "Exact text to find and replace. Must appear verbatim in the file." },
+                    "new_string": { "type": "string", "description": "Replacement text." },
+                    "replace_all": { "type": "boolean", "description": "If true, replace all occurrences instead of just the first (default false)." }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }
+        }
+    })
+}
+
+fn tool_shell_command() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "shell_command",
+            "description": "Run a shell command and return combined stdout+stderr. Use for git, grep, curl, python scripts, etc. Output is capped at 16 KB.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string", "description": "Shell command to execute (passed to sh -c)." },
+                    "cwd": { "type": "string", "description": "Working directory (optional; defaults to the bot's working directory)." },
+                    "timeout_secs": { "type": "integer", "description": "Seconds before the command is killed. Defaults to the server-configured SHELL_COMMAND_TIMEOUT_SECS. Use a higher value for builds, tests, or long-running scripts (max 600)." }
+                },
+                "required": ["cmd"]
+            }
+        }
+    })
+}
+
+fn tool_list_dir() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List the contents of a directory. Subdirectory names are shown with a trailing '/'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative path to the directory." }
+                },
+                "required": ["path"]
+            }
+        }
+    })
+}
+
+fn tool_fetch_page() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "fetch_page",
+            "description": "Fetch a web page. mode='raw' returns the raw response body (up to 8 KB); mode='text' returns a clean markdown rendering via Jina Reader — use this for articles, documentation, or any JS-rendered page. Both modes accept any public HTTP/HTTPS URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL to fetch (must be HTTP or HTTPS)." },
+                    "mode": {
                         "type": "string",
-                        "description": "The URL to fetch (must be HTTP or HTTPS)."
+                        "enum": ["raw", "text"],
+                        "description": "raw = plain HTTP response body; text = cleaned markdown via Jina Reader (recommended for most pages)."
                     }
                 },
                 "required": ["url"]
@@ -209,7 +341,7 @@ fn tool_send_update() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "send_update",
-            "description": "Send a progress message to the user now and keep working. Use this to keep the user informed during long tasks — for example, after completing one step and before starting the next. This is NOT your final reply; your final reply will be generated automatically when you finish all your work.",
+            "description": "Send a progress message to the user now and keep working. Use this to keep the user informed during long tasks — for example, after completing one step and before starting the next. You must still call final_reply or reflect(done=true) when you are done.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -224,30 +356,6 @@ fn tool_send_update() -> serde_json::Value {
     })
 }
 
-fn tool_reply_to_user() -> serde_json::Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "reply_to_user",
-            "description": "Send your reply to the user. This is the primary way to respond. Use it immediately for conversational messages, greetings, reactions, opinions, and anything not requiring external data. For research tasks, complete the work first with delegate_cli or other tools, then call this with your findings. If the research involved many tool calls and you want a polished synthesis instead, call reflect(done=true) — otherwise just call this with the result yourself.",
-            "description_note": "Do NOT call this before doing requested work. Do NOT use background=true unless you genuinely have more work to continue after replying.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The reply text to send to the user."
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": "Set true to send this reply immediately and keep working on remaining tasks. Omit or set false (default) to send and stop."
-                    }
-                },
-                "required": ["message"]
-            }
-        }
-    })
-}
 
 /// `include_identity`: true in the consolidation pass (exposes the "identity" enum value and
 /// its surgical-edit guidance); false everywhere else.
@@ -439,7 +547,7 @@ fn tool_final_reply() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "final_reply",
-            "description": "Send a complete, polished reply to the user and end this session. Use this when you have finished all your work and are ready to present results. Unlike reply_to_user, this always terminates the session immediately.",
+            "description": "Send a complete, polished reply to the user and end this session immediately. Use this when you have finished all your work and are ready to present results.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -454,29 +562,18 @@ fn tool_final_reply() -> serde_json::Value {
     })
 }
 
-fn tool_nothing(description: &str) -> serde_json::Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "nothing",
-            "description": description,
-            "parameters": { "type": "object", "properties": {} }
-        }
-    })
-}
-
 fn tool_set_task() -> serde_json::Value {
     json!({
         "type": "function",
         "function": {
             "name": "set_task",
-            "description": "Record the current task or active project I'm helping with. Appears in every system prompt after 'Who I Am'. Call this when the user starts a new project or multi-step task.",
+            "description": "Record the current task or active project. Appears in every system prompt. Pass an empty string to clear the current task once it is complete or no longer relevant.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "description": {
                         "type": "string",
-                        "description": "Short description of the current task (1-2 sentences)."
+                        "description": "Short description of the current task (1-2 sentences). Pass \"\" to clear."
                     }
                 },
                 "required": ["description"]
@@ -485,12 +582,58 @@ fn tool_set_task() -> serde_json::Value {
     })
 }
 
-fn tool_clear_task() -> serde_json::Value {
+fn tool_read_core_memory() -> serde_json::Value {
     json!({
         "type": "function",
         "function": {
-            "name": "clear_task",
-            "description": "Clear the current task once it is complete or no longer relevant.",
+            "name": "read_core_memory",
+            "description": "Read the current state of your core memory (identity, beliefs, user profile, curiosity queue). Useful mid-session after updates to verify what was written.",
+            "parameters": { "type": "object", "properties": {} }
+        }
+    })
+}
+
+fn tool_list_episodic_recent() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list_episodic_recent",
+            "description": "Return the N most-recent episodic memory entries, ordered oldest-first. Useful for consolidation or reviewing recent activity.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": { "type": "integer", "description": "Number of recent entries to return (default 10, max 50)." }
+                }
+            }
+        }
+    })
+}
+
+fn tool_update_agenda_item() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "update_agenda_item",
+            "description": "Update the status or append a note to a pending agenda item. Use status 'in_progress' when starting work on an item.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": { "type": "string", "description": "UUID of the agenda item to update." },
+                    "status": { "type": "string", "enum": ["pending", "in_progress"], "description": "New status (optional)." },
+                    "note": { "type": "string", "description": "Note to append to the item's context (optional)." }
+                },
+                "required": ["item_id"]
+            }
+        }
+    })
+}
+
+fn tool_get_current_time() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time in both local time and UTC. Use this when you need the current timestamp for scheduling calculations or time-sensitive decisions.",
             "parameters": { "type": "object", "properties": {} }
         }
     })
@@ -515,7 +658,7 @@ fn tool_reflect() -> serde_json::Value {
                     },
                     "reply": {
                         "type": "string",
-                        "description": "Optional: if you know what you want to say to the user, put it here. Synthesis will use this as a starting point and polish it. Omit to let the harness compose the reply entirely from your tool results."
+                        "description": "Optional draft reply for the user. When done=true in a user conversation, this is passed to the synthesis step as a starting point. Omit to let the harness compose the reply from your tool results. Ignored in background contexts (heartbeat, consolidation)."
                     }
                 },
                 "required": ["observation", "done"]
@@ -525,89 +668,95 @@ fn tool_reflect() -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool definitions (JSON Schema sent to LM Studio)
+// Tool sets by context (JSON Schema arrays sent to LM Studio)
 // ---------------------------------------------------------------------------
 
-pub fn tool_definitions() -> serde_json::Value {
-    json!([
-        tool_delegate_cli(),
-        tool_fetch_url(),
-        tool_schedule_task(),
-        tool_list_schedules(),
-        tool_delete_schedule(),
-        tool_update_schedule(),
-        tool_schedule_once(),
-        tool_send_update(),
-        tool_reply_to_user(),
-        tool_final_reply(),
-        tool_update_core_memory(false),
-        tool_remember(),
-        tool_recall(),
-        tool_list_interests(),
-        tool_forget(),
-        tool_set_task(),
-        tool_clear_task(),
-        tool_reflect(),
-        tool_add_agenda_item(),
-        tool_list_agenda_items(),
-        tool_cancel_agenda_item(),
-    ])
-}
-
-/// Tool definitions for the post-conversation interest eval pass.
-/// Mirrors run_memory_eval: restricted set so the LLM can only register,
-/// retire, list, or declare nothing — no other side-effects possible.
-pub fn interest_eval_tools() -> serde_json::Value {
-    json!([
-        tool_add_interest(),
-        tool_retire_interest(),
-        tool_list_interests(),
-        tool_nothing("The conversation contained no explicit interest tracking request from the user."),
-    ])
-}
-
-/// Tool definitions for the heartbeat / interest-check agentic loops.
-pub fn heartbeat_tool_definitions() -> serde_json::Value {
-    json!([
-        tool_delegate_cli(),
-        tool_fetch_url(),
-        tool_reply_to_user(),
-        tool_final_reply(),
-        tool_add_interest(),
-        tool_retire_interest(),
-        tool_update_core_memory(false),
-        tool_recall(),
-        tool_forget(),
-        tool_set_task(),
-        tool_clear_task(),
-        tool_reflect(),
-        tool_add_agenda_item(),
-        tool_list_agenda_items(),
-        tool_cancel_agenda_item(),
-        tool_complete_agenda_item(),
-        tool_nothing("Do nothing and stay silent. Use this as the default when there is nothing worth sharing with the user right now."),
-    ])
-}
-
-/// Tool definitions for the consolidation reflection pass.
-/// Allows the model to update core memory, persist observations, manage interests.
-pub fn consolidation_tool_definitions() -> serde_json::Value {
-    json!([
-        tool_update_core_memory(true),
-        tool_fetch_url(),
-        tool_final_reply(),
-        tool_remember(),
-        tool_add_interest(),
-        tool_retire_interest(),
-        tool_set_task(),
-        tool_clear_task(),
-        tool_reflect(),
-        tool_add_agenda_item(),
-        tool_list_agenda_items(),
-        tool_cancel_agenda_item(),
-        tool_complete_agenda_item(),
-        tool_nothing("Nothing to update from this consolidation cycle."),
-    ])
+pub fn tools_for_context(ctx: ToolContext) -> serde_json::Value {
+    match ctx {
+        ToolContext::User => json!([
+            tool_read_file(),
+            tool_write_file(),
+            tool_edit_file(),
+            tool_shell_command(),
+            tool_list_dir(),
+            tool_fetch_page(),
+            tool_schedule_task(),
+            tool_list_schedules(),
+            tool_delete_schedule(),
+            tool_update_schedule(),
+            tool_schedule_once(),
+            tool_send_update(),
+            tool_final_reply(),
+            tool_update_core_memory(false),
+            tool_read_core_memory(),
+            tool_remember(),
+            tool_recall(),
+            tool_forget(),
+            tool_list_episodic_recent(),
+            tool_list_interests(),
+            tool_set_task(),
+            tool_reflect(),
+            tool_add_agenda_item(),
+            tool_list_agenda_items(),
+            tool_update_agenda_item(),
+            tool_cancel_agenda_item(),
+            tool_get_current_time(),
+        ]),
+        ToolContext::Heartbeat => json!([
+            tool_read_file(),
+            tool_write_file(),
+            tool_edit_file(),
+            tool_shell_command(),
+            tool_list_dir(),
+            tool_fetch_page(),
+            tool_send_update(),
+            tool_final_reply(),
+            tool_add_interest(),
+            tool_retire_interest(),
+            tool_update_core_memory(false),
+            tool_read_core_memory(),
+            tool_recall(),
+            tool_forget(),
+            tool_list_episodic_recent(),
+            tool_set_task(),
+            tool_reflect(),
+            tool_add_agenda_item(),
+            tool_list_agenda_items(),
+            tool_update_agenda_item(),
+            tool_cancel_agenda_item(),
+            tool_complete_agenda_item(),
+            tool_get_current_time(),
+        ]),
+        ToolContext::InterestEval => json!([
+            tool_add_interest(),
+            tool_retire_interest(),
+            tool_list_interests(),
+            tool_reflect(),
+        ]),
+        ToolContext::Consolidation => json!([
+            tool_update_core_memory(true),
+            tool_read_core_memory(),
+            tool_read_file(),
+            tool_write_file(),
+            tool_edit_file(),
+            tool_fetch_page(),
+            tool_final_reply(),
+            tool_remember(),
+            tool_recall(),
+            tool_forget(),
+            tool_list_episodic_recent(),
+            tool_add_interest(),
+            tool_retire_interest(),
+            tool_set_task(),
+            tool_reflect(),
+            tool_add_agenda_item(),
+            tool_list_agenda_items(),
+            tool_update_agenda_item(),
+            tool_cancel_agenda_item(),
+            tool_complete_agenda_item(),
+            tool_get_current_time(),
+        ]),
+    }
 }
 
 fn tool_add_agenda_item() -> serde_json::Value {
@@ -693,21 +842,31 @@ fn tool_complete_agenda_item() -> serde_json::Value {
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-async fn fetch_url_impl(url: &str) -> anyhow::Result<String> {
+async fn fetch_page_impl(url: &str, mode: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(45))
+        .user_agent("AnieBot/1.0")
         .build()
         .context("Failed to build HTTP client")?;
+    let (effective_url, cap) = if mode == "text" {
+        (format!("https://r.jina.ai/{}", url), 32 * 1024)
+    } else {
+        (url.to_string(), 8 * 1024)
+    };
     let response = client
-        .get(url)
+        .get(&effective_url)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
     let status = response.status();
     let bytes = response.bytes().await.map_err(|e| anyhow::anyhow!("Failed to read response: {}", e))?;
-    let cap = bytes.len().min(8 * 1024);
-    let text = String::from_utf8_lossy(&bytes[..cap]).into_owned();
-    Ok(format!("HTTP {}\n\n{}", status, text))
+    let capped = bytes.len().min(cap);
+    let text = String::from_utf8_lossy(&bytes[..capped]).into_owned();
+    if mode == "text" {
+        Ok(text)
+    } else {
+        Ok(format!("HTTP {}\n\n{}", status, text))
+    }
 }
 
 pub async fn dispatch_tool_call(
@@ -725,29 +884,139 @@ pub async fn dispatch_tool_call(
                 .context("send_update missing 'message' argument")?;
             Ok(message.to_string())
         }
-        "reply_to_user" => {
-            let message = args["message"].as_str()
-                .context("reply_to_user missing 'message' argument")?;
-            Ok(message.to_string())
-        }
         "final_reply" => {
             let text = args["text"].as_str().unwrap_or("").to_string();
             Ok(text)
         }
-        "delegate_cli" => {
-            let task = args["task"].as_str()
-                .context("delegate_cli missing 'task' argument")?;
-            tracing::info!("Delegating to copilot: {}", task);
-            match cli_wrapper::run(&config, task).await {
-                Ok(output) => Ok(format!("✅ Done!\n\n{}", output)),
-                Err(e) => Ok(format!("❌ copilot failed: {}", e)),
+        "read_file" => {
+            let path = args["path"].as_str().context("read_file missing 'path'")?;
+            tracing::info!("read_file: {}", path);
+            match tokio::fs::read_to_string(path).await {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let offset = args["offset"].as_u64().map(|n| (n as usize).saturating_sub(1)).unwrap_or(0);
+                    let limit = args["limit"].as_u64().map(|n| n as usize).unwrap_or(usize::MAX);
+                    let slice: Vec<String> = lines.iter().skip(offset).take(limit)
+                        .enumerate()
+                        .map(|(i, l)| format!("{}: {}", offset + i + 1, l))
+                        .collect();
+                    Ok(slice.join("\n"))
+                }
+                Err(e) => Ok(format!("❌ read_file failed: {}", e)),
             }
         }
-        "fetch_url" => {
-            let url = args["url"].as_str()
-                .context("fetch_url missing 'url' argument")?;
-            tracing::info!("fetch_url: {}", url);
-            match fetch_url_impl(url).await {
+        "write_file" => {
+            let path = args["path"].as_str().context("write_file missing 'path'")?;
+            let content = args["content"].as_str().context("write_file missing 'content'")?;
+            tracing::info!("write_file: {}", path);
+            // Create parent directories if needed.
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+            match tokio::fs::write(path, content).await {
+                Ok(()) => Ok(format!("✅ Written {} bytes to {}", content.len(), path)),
+                Err(e) => Ok(format!("❌ write_file failed: {}", e)),
+            }
+        }
+        "edit_file" => {
+            let path = args["path"].as_str().context("edit_file missing 'path'")?;
+            let old_string = args["old_string"].as_str().context("edit_file missing 'old_string'")?;
+            let new_string = args["new_string"].as_str().context("edit_file missing 'new_string'")?;
+            let replace_all = args["replace_all"].as_bool().unwrap_or(false);
+            tracing::info!("edit_file: {}", path);
+            match tokio::fs::read_to_string(path).await {
+                Err(e) => Ok(format!("❌ edit_file failed to read {}: {}", path, e)),
+                Ok(content) => {
+                    let count = content.matches(old_string).count();
+                    if count == 0 {
+                        return Ok(format!(
+                            "❌ old_string not found in {}. Read the file first and use the exact text.",
+                            path
+                        ));
+                    }
+                    let new_content = if replace_all {
+                        content.replace(old_string, new_string)
+                    } else {
+                        content.replacen(old_string, new_string, 1)
+                    };
+                    // Atomic write: write to .tmp then rename.
+                    let tmp_path = format!("{}.tmp", path);
+                    if let Err(e) = tokio::fs::write(&tmp_path, &new_content).await {
+                        return Ok(format!("❌ edit_file failed to write tmp file: {}", e));
+                    }
+                    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        return Ok(format!("❌ edit_file failed to rename tmp file: {}", e));
+                    }
+                    if !replace_all && count > 1 {
+                        Ok(format!(
+                            "✅ edit applied to {} (replaced first of {} occurrences — use replace_all=true to replace all)",
+                            path, count
+                        ))
+                    } else {
+                        Ok(format!("✅ edit applied to {}", path))
+                    }
+                }
+            }
+        }
+        "shell_command" => {
+            let cmd = args["cmd"].as_str().context("shell_command missing 'cmd'")?;
+            let cwd = args["cwd"].as_str();
+            let default_timeout = config.shell_command_timeout_secs;
+            let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(default_timeout).min(600);
+            tracing::info!("shell_command (timeout={}s): {}", timeout_secs, cmd);
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(cmd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(dir) = cwd {
+                command.current_dir(dir);
+            }
+            let timeout = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(timeout, command.output()).await {
+                Err(_) => Ok(format!("❌ shell_command timed out after {}s", timeout_secs)),
+                Ok(Err(e)) => Ok(format!("❌ shell_command failed: {}", e)),
+                Ok(Ok(out)) => {
+                    let cap = 16 * 1024;
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let combined = if stderr.trim().is_empty() {
+                        stdout.to_string()
+                    } else if stdout.trim().is_empty() {
+                        stderr.to_string()
+                    } else {
+                        format!("{}\n--- stderr ---\n{}", stdout, stderr)
+                    };
+                    let capped = if combined.len() > cap { &combined[..cap] } else { &combined };
+                    let exit = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                    Ok(format!("exit={}\n{}", exit, capped))
+                }
+            }
+        }
+        "list_dir" => {
+            let path = args["path"].as_str().context("list_dir missing 'path'")?;
+            tracing::info!("list_dir: {}", path);
+            match tokio::fs::read_dir(path).await {
+                Ok(mut dir) => {
+                    let mut entries: Vec<String> = Vec::new();
+                    while let Ok(Some(entry)) = dir.next_entry().await {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let suffix = if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) { "/" } else { "" };
+                        entries.push(format!("{}{}", name, suffix));
+                    }
+                    entries.sort();
+                    Ok(entries.join("\n"))
+                }
+                Err(e) => Ok(format!("❌ list_dir failed: {}", e)),
+            }
+        }
+        "fetch_page" => {
+            let url = args["url"].as_str().context("fetch_page missing 'url'")?;
+            let mode = args["mode"].as_str().unwrap_or("raw");
+            tracing::info!("fetch_page: {} (mode={})", url, mode);
+            match fetch_page_impl(url, mode).await {
                 Ok(content) => Ok(content),
                 Err(e) => Ok(format!("❌ fetch failed: {}", e)),
             }
@@ -1024,21 +1293,42 @@ pub async fn dispatch_tool_call(
             }).collect::<Vec<_>>().join("\n\n");
             Ok(format!("Active interests:\n\n{}", list))
         }
-        "nothing" => Ok(String::new()),
         "reflect" => {
             let observation = args["observation"].as_str().unwrap_or("(no observation)");
             let done = args["done"].as_bool().unwrap_or(false);
             Ok(format!("Reflection recorded: {observation} (concluded: {done})"))
         }
+        "read_core_memory" => {
+            let core = core_memory::load().await?;
+            Ok(core.to_prompt_block())
+        }
+        "list_episodic_recent" => {
+            let n = args["n"].as_u64().unwrap_or(10).min(50) as usize;
+            let entries = episodic::load_recent(n).await?;
+            if entries.is_empty() {
+                Ok("No episodic entries yet.".into())
+            } else {
+                let lines: Vec<String> = entries.iter().map(|e| {
+                    format!("[{}] (importance: {}, id: {}) {}", e.timestamp.format("%Y-%m-%d %H:%M"), e.importance, e.id, e.content)
+                }).collect();
+                Ok(lines.join("\n"))
+            }
+        }
+        "get_current_time" => {
+            let local_now = Local::now();
+            let utc_now = Utc::now();
+            Ok(format!("Local: {}\nUTC:   {}", local_now.format("%Y-%m-%d %H:%M:%S %Z"), utc_now.format("%Y-%m-%dT%H:%M:%SZ")))
+        }
         "set_task" => {
             let desc = args["description"].as_str()
                 .context("set_task missing 'description'")?;
-            core_memory::set_task(desc).await?;
-            Ok(format!("\u{2705} Current task set: {desc}"))
-        }
-        "clear_task" => {
-            core_memory::clear_task().await?;
-            Ok("\u{2705} Current task cleared.".to_string())
+            if desc.is_empty() {
+                core_memory::clear_task().await?;
+                Ok("✅ Current task cleared.".to_string())
+            } else {
+                core_memory::set_task(desc).await?;
+                Ok(format!("✅ Current task set: {desc}"))
+            }
         }
         "add_agenda_item" => {
             let description = args["description"].as_str()
@@ -1068,9 +1358,24 @@ pub async fn dispatch_tool_call(
             let id = args["item_id"].as_str()
                 .context("cancel_agenda_item missing 'item_id'")?;
             if crate::agenda::cancel(id).await? {
-                Ok(format!("\u{2705} Task `{}` cancelled.", id))
+                Ok(format!("✅ Task `{}` cancelled.", id))
             } else {
-                Ok(format!("\u{274c} No agenda item found with ID `{}`.", id))
+                Ok(format!("❌ No agenda item found with ID `{}`.", id))
+            }
+        }
+        "update_agenda_item" => {
+            let id = args["item_id"].as_str()
+                .context("update_agenda_item missing 'item_id'")?;
+            let status = args["status"].as_str().and_then(|s| match s {
+                "pending" => Some(crate::agenda::AgendaStatus::Pending),
+                "in_progress" => Some(crate::agenda::AgendaStatus::InProgress),
+                _ => None,
+            });
+            let note = args["note"].as_str();
+            if crate::agenda::update(id, status, note).await? {
+                Ok(format!("✅ Agenda item `{}` updated.", id))
+            } else {
+                Ok(format!("❌ No agenda item found with ID `{}`.", id))
             }
         }
         "complete_agenda_item" => {

@@ -79,6 +79,26 @@ pub async fn cancel(id: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// Update the status and/or append a note to the context of an existing agenda item.
+/// Returns `false` if no item with the given ID was found.
+pub async fn update(id: &str, status: Option<AgendaStatus>, note: Option<&str>) -> anyhow::Result<bool> {
+    let mut items = load().await?;
+    let Some(item) = items.iter_mut().find(|i| i.id == id) else {
+        return Ok(false);
+    };
+    if let Some(s) = status {
+        item.status = s;
+    }
+    if let Some(n) = note {
+        match &mut item.context {
+            Some(ctx) => { ctx.push('\n'); ctx.push_str(n); }
+            None => item.context = Some(n.to_string()),
+        }
+    }
+    save(&items).await?;
+    Ok(true)
+}
+
 /// Returns only Pending and InProgress items.
 pub async fn list_pending() -> anyhow::Result<Vec<AgendaItem>> {
     let items = load().await?;

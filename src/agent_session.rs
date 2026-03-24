@@ -16,13 +16,6 @@ use crate::tools::LmToolCall;
 // Constants
 // ---------------------------------------------------------------------------
 
-const PARALLEL_SAFE_TOOLS: &[&str] = &[
-    "fetch_url",
-    "recall",
-    "list_interests",
-    "list_agenda_items",
-    "list_schedules",
-];
 
 const TOOL_CALL_WARN_THRESHOLD: usize = 8;
 const TOOL_CALL_HARD_LIMIT: usize = 15;
@@ -89,8 +82,6 @@ pub struct StepAction {
 /// Owns all mutable state for one agentic run (user turn, heartbeat, etc.).
 pub struct AgentSession {
     pub config: Arc<Config>,
-    /// Swapped to `background_copilot_model` when configured, for CLI calls.
-    pub call_config: Arc<Config>,
     pub bot: Bot,
     pub scheduler: Arc<SchedulerHandle>,
     /// Full LM context window (grows each iteration).
@@ -119,18 +110,8 @@ impl AgentSession {
         send_reply: bool,
         max_iters: usize,
     ) -> Self {
-        let call_config = if config.background_copilot_model.is_some() {
-            Arc::new(Config {
-                copilot_model: config.background_copilot_model.clone(),
-                ..(*config).clone()
-            })
-        } else {
-            config.clone()
-        };
-
         Self {
             config,
-            call_config,
             bot,
             scheduler,
             messages: initial_messages,
@@ -412,7 +393,7 @@ impl AgentSession {
             );
             let result = "[Already completed — results are already in your context above. \
                            Do not repeat this call. Review the results, then call \
-                           reply_to_user with your answer or reflect(done=true) to wrap up.]"
+                           final_reply with your answer or reflect(done=true) to wrap up.]"
                 .to_string();
             let now = Utc::now();
             self.messages.push(LmMessage {
@@ -446,7 +427,7 @@ impl AgentSession {
                 content: Some(format!(
                     "[System: You already ran `{}` with these exact arguments earlier this turn. \
                      Stop repeating tool calls. Review results in your context above, \
-                     then call reply_to_user with your answer or reflect(done=true) to wrap up.]",
+                     then call final_reply with your answer or reflect(done=true) to wrap up.]",
                     tool_name
                 )),
                 tool_calls: None,
@@ -471,7 +452,7 @@ impl AgentSession {
         // Terminal tools are excluded — the loop must be able to conclude.
         let is_terminal = matches!(
             tool_name.as_str(),
-            "reply_to_user" | "nothing" | "reflect" | "send_update" | "final_reply"
+            "reflect" | "send_update" | "final_reply"
         );
         if !is_terminal {
             let count = {
@@ -539,7 +520,7 @@ impl AgentSession {
         );
         let dispatch_start = std::time::Instant::now();
         let result = tools::dispatch_tool_call(
-            self.call_config.clone(),
+            self.config.clone(),
             self.bot.clone(),
             self.scheduler.clone(),
             call,
@@ -609,48 +590,6 @@ impl AgentSession {
                 Ok(StepAction { should_exit: true, final_reply: Some(result) })
             }
 
-            "reply_to_user" => {
-                let background = raw_args["background"].as_bool().unwrap_or(false);
-                if self.send_reply || background {
-                    self.bot
-                        .send_message(ChatId(self.config.allowed_user_id as i64), result.clone())
-                        .await?;
-                }
-                // Always persist the reply as an assistant message.
-                self.new_messages.push(ConversationMessage {
-                    role: "assistant".into(),
-                    content: Some(result.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    timestamp: Utc::now(),
-                });
-                if !background {
-                    return Ok(StepAction { should_exit: true, final_reply: Some(result) });
-                }
-                // background=true: push the tool-call pair into LM context so the
-                // transcript stays well-formed, then inject a continuation hint.
-                self.messages.push(LmMessage {
-                    role: "assistant".into(),
-                    content: None,
-                    tool_calls: single_call_json,
-                    tool_call_id: None,
-                });
-                self.messages.push(LmMessage {
-                    role: "tool".into(),
-                    content: Some(result),
-                    tool_calls: None,
-                    tool_call_id: Some(call_id),
-                });
-                self.push_user_message("[System: Reply sent. Continue working.]");
-                tracing::info!(
-                    "Agentic loop iter {}: reply_to_user(background=true) — reply sent, continuing",
-                    iter + 1
-                );
-                Ok(StepAction { should_exit: false, final_reply: None })
-            }
-
-            "nothing" => Ok(StepAction { should_exit: true, final_reply: None }),
-
             "reflect" => {
                 if raw_args["done"].as_bool().unwrap_or(false) {
                     tracing::info!("Agentic loop: reflect concluded at iter {}", iter + 1);
@@ -696,16 +635,13 @@ impl AgentSession {
 
         let all_parallel_safe = all_tool_calls
             .iter()
-            .all(|c| PARALLEL_SAFE_TOOLS.contains(&c.function.name.as_str()));
+            .all(|c| tools::is_parallel_safe(&c.function.name));
 
         // Separate terminal calls from non-terminal to ensure non-terminal
         // tools run first (they may produce data that informs the reply).
         let (terminal_calls, mut other_calls): (Vec<_>, Vec<_>) =
             all_tool_calls.into_iter().partition(|c| {
-                matches!(
-                    c.function.name.as_str(),
-                    "reply_to_user" | "nothing" | "reflect" | "final_reply"
-                )
+                matches!(c.function.name.as_str(), "reflect" | "final_reply")
             });
 
         // Suppressed items: (call_id, tool_name, reason_msg) — get synthetic results below.
@@ -777,7 +713,7 @@ impl AgentSession {
                 let call_id = call.id.clone();
                 let tool_name = call.function.name.clone();
                 let r = tools::dispatch_tool_call(
-                    self.call_config.clone(),
+                    self.config.clone(),
                     self.bot.clone(),
                     self.scheduler.clone(),
                     call,
@@ -811,7 +747,7 @@ impl AgentSession {
                     let call_id = call.id.clone();
                     let tool_name = call.function.name.clone();
                     let (cc, b, s) =
-                        (self.call_config.clone(), self.bot.clone(), self.scheduler.clone());
+                        (self.config.clone(), self.bot.clone(), self.scheduler.clone());
                     join_set.spawn(async move {
                         let r = tools::dispatch_tool_call(cc, b, s, call).await;
                         (idx, call_id, tool_name, raw_args, r)
@@ -832,7 +768,7 @@ impl AgentSession {
                     let call_id = call.id.clone();
                     let tool_name = call.function.name.clone();
                     let r = tools::dispatch_tool_call(
-                        self.call_config.clone(),
+                        self.config.clone(),
                         self.bot.clone(),
                         self.scheduler.clone(),
                         call,
@@ -855,7 +791,7 @@ impl AgentSession {
             let call_id = call.id.clone();
             let tool_name = call.function.name.clone();
             let r = tools::dispatch_tool_call(
-                self.call_config.clone(),
+                self.config.clone(),
                 self.bot.clone(),
                 self.scheduler.clone(),
                 call,
@@ -909,27 +845,7 @@ impl AgentSession {
         for (_idx, call_id, tool_name, raw_args, result) in results {
             let result_str = result.unwrap_or_else(|e| format!("❌ {}", e));
             match tool_name.as_str() {
-                "reply_to_user" => {
-                    let bg = raw_args["background"].as_bool().unwrap_or(false);
-                    reply_result = Some((result_str.clone(), bg));
-                    // Always push the tool result so every tool call_id in the
-                    // assistant message has a matching tool result in history.
-                    self.messages.push(LmMessage {
-                        role: "tool".into(),
-                        content: Some(result_str.clone()),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                    });
-                    self.new_messages.push(ConversationMessage {
-                        role: "tool".into(),
-                        content: Some(result_str),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id),
-                        timestamp: now,
-                    });
-                }
                 "final_reply" => {
-                    // final_reply in multi-call: always non-background
                     reply_result = Some((result_str.clone(), false));
                     self.messages.push(LmMessage {
                         role: "tool".into(),
@@ -940,24 +856,6 @@ impl AgentSession {
                     self.new_messages.push(ConversationMessage {
                         role: "tool".into(),
                         content: Some(result_str),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id),
-                        timestamp: now,
-                    });
-                }
-                "nothing" => {
-                    return_none = true;
-                    // Push empty tool result to keep the assistant → tool pair
-                    // well-formed in persisted history.
-                    self.messages.push(LmMessage {
-                        role: "tool".into(),
-                        content: Some(String::new()),
-                        tool_calls: None,
-                        tool_call_id: Some(call_id.clone()),
-                    });
-                    self.new_messages.push(ConversationMessage {
-                        role: "tool".into(),
-                        content: Some(String::new()),
                         tool_calls: None,
                         tool_call_id: Some(call_id),
                         timestamp: now,
@@ -999,9 +897,9 @@ impl AgentSession {
             }
         }
 
-        // Handle terminal outcome.
-        if let Some((reply, background)) = reply_result {
-            if self.send_reply || background {
+        // Handle terminal outcome (final_reply in a multi-call batch).
+        if let Some((reply, _background)) = reply_result {
+            if self.send_reply {
                 self.bot
                     .send_message(ChatId(self.config.allowed_user_id as i64), reply.clone())
                     .await?;
@@ -1013,17 +911,7 @@ impl AgentSession {
                 tool_call_id: None,
                 timestamp: now,
             });
-            if !background {
-                return Ok(StepAction { should_exit: true, final_reply: Some(reply) });
-            }
-            // background=true: tool result already pushed unconditionally in the match arm.
-            // Inject the continuation hint and fall through so the loop iterates.
-            self.push_user_message("[System: Reply sent. Continue working.]");
-            tracing::info!(
-                "Agentic loop iter {}: multi-call reply_to_user(background=true) — reply sent, continuing",
-                iter + 1
-            );
-            // No return — loop continues naturally.
+            return Ok(StepAction { should_exit: true, final_reply: Some(reply) });
         }
         if return_none {
             return Ok(StepAction { should_exit: true, final_reply: None });
